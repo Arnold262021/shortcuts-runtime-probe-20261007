@@ -1,0 +1,34 @@
+name: Shortcuts Simulator Inspection
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shortcuts-synthetic-simulator
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - name: Read generic probe source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Inspect fresh simulator
+        run: python3 probe/inspect_simulator.py
+      - name: Preserve synthetic UI evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: simulator-inspection-${{ github.run_id }}
+          path: |
+            artifacts/*.json
+            artifacts/*.txt
+            artifacts/*.png
+          retention-days: 1
+          if-no-files-found: warn

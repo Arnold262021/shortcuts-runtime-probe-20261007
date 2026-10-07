@@ -1,0 +1,80 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000011 /* AppDelegate.swift */; };
+		A10000000000000000000002 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* UIKit.framework */; };
+		A10000000000000000000003 /* ShortcutsObservationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000021 /* ShortcutsObservationTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A10000000000000000000071 /* PBXContainerItemProxy */ = {isa = PBXContainerItemProxy; containerPortal = A10000000000000000000060 /* Project object */; proxyType = 1; remoteGlobalIDString = A10000000000000000000050; remoteInfo = AppleSimulatorProbe; };
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A10000000000000000000010 /* AppleSimulatorProbe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppleSimulatorProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000011 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		A10000000000000000000012 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		A10000000000000000000013 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A10000000000000000000020 /* AppleSimulatorProbeUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AppleSimulatorProbeUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000021 /* ShortcutsObservationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutsObservationTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000023 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000031 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000002 /* UIKit.framework in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000032 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A10000000000000000000040 = {isa = PBXGroup; children = (A10000000000000000000041 /* AppleSimulatorProbe */, A10000000000000000000042 /* AppleSimulatorProbeUITests */, A10000000000000000000043 /* Frameworks */, A10000000000000000000044 /* Products */,); sourceTree = "<group>"; };
+		A10000000000000000000041 /* AppleSimulatorProbe */ = {isa = PBXGroup; children = (A10000000000000000000011 /* AppDelegate.swift */, A10000000000000000000013 /* Info.plist */,); path = AppleSimulatorProbe; sourceTree = "<group>"; };
+		A10000000000000000000042 /* AppleSimulatorProbeUITests */ = {isa = PBXGroup; children = (A10000000000000000000021 /* ShortcutsObservationTests.swift */, A10000000000000000000023 /* Info.plist */,); path = AppleSimulatorProbeUITests; sourceTree = "<group>"; };
+		A10000000000000000000043 /* Frameworks */ = {isa = PBXGroup; children = (A10000000000000000000012 /* UIKit.framework */,); name = Frameworks; sourceTree = "<group>"; };
+		A10000000000000000000044 /* Products */ = {isa = PBXGroup; children = (A10000000000000000000010 /* AppleSimulatorProbe.app */, A10000000000000000000020 /* AppleSimulatorProbeUITests.xctest */,); name = Products; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A10000000000000000000050 /* AppleSimulatorProbe */ = {isa = PBXNativeTarget; buildConfigurationList = A10000000000000000000061 /* Build configuration list for PBXNativeTarget "AppleSimulatorProbe" */; buildPhases = (A10000000000000000000030 /* Sources */, A10000000000000000000031 /* Frameworks */, A10000000000000000000033 /* Resources */,); buildRules = (); dependencies = (); name = AppleSimulatorProbe; productName = AppleSimulatorProbe; productReference = A10000000000000000000010 /* AppleSimulatorProbe.app */; productType = "com.apple.product-type.application"; };
+		A10000000000000000000051 /* AppleSimulatorProbeUITests */ = {isa = PBXNativeTarget; buildConfigurationList = A10000000000000000000062 /* Build configuration list for PBXNativeTarget "AppleSimulatorProbeUITests" */; buildPhases = (A10000000000000000000034 /* Sources */, A10000000000000000000032 /* Frameworks */, A10000000000000000000035 /* Resources */,); buildRules = (); dependencies = (A10000000000000000000070 /* PBXTargetDependency */,); name = AppleSimulatorProbeUITests; productName = AppleSimulatorProbeUITests; productReference = A10000000000000000000020 /* AppleSimulatorProbeUITests.xctest */; productType = "com.apple.product-type.bundle.ui-testing"; };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A10000000000000000000060 /* Project object */ = {isa = PBXProject; attributes = { LastUpgradeCheck = 2700; TargetAttributes = { A10000000000000000000050 = { CreatedOnToolsVersion = 27.0; }; A10000000000000000000051 = { CreatedOnToolsVersion = 27.0; TestTargetID = A10000000000000000000050; }; }; }; buildConfigurationList = A10000000000000000000063 /* Build configuration list for PBXProject "AppleSimulatorProbe" */; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base,); mainGroup = A10000000000000000000040; productRefGroup = A10000000000000000000044 /* Products */; projectDirPath = ""; projectRoot = ""; targets = (A10000000000000000000050 /* AppleSimulatorProbe */, A10000000000000000000051 /* AppleSimulatorProbeUITests */,); };
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A10000000000000000000033 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000035 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A10000000000000000000030 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001 /* AppDelegate.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000034 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000003 /* ShortcutsObservationTests.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A10000000000000000000070 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = A10000000000000000000050 /* AppleSimulatorProbe */; targetProxy = A10000000000000000000071 /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		A10000000000000000000080 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; IPHONEOS_DEPLOYMENT_TARGET = 27.0; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; }; name = Debug; };
+		A10000000000000000000081 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; IPHONEOS_DEPLOYMENT_TARGET = 27.0; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; }; name = Release; };
+		A10000000000000000000082 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGNING_ALLOWED = NO; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AppleSimulatorProbe/Info.plist; PRODUCT_BUNDLE_IDENTIFIER = org.example.AppleSimulatorProbe; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphonesimulator iphoneos"; TARGETED_DEVICE_FAMILY = 1; }; name = Debug; };
+		A10000000000000000000083 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGNING_ALLOWED = NO; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AppleSimulatorProbe/Info.plist; PRODUCT_BUNDLE_IDENTIFIER = org.example.AppleSimulatorProbe; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphonesimulator iphoneos"; TARGETED_DEVICE_FAMILY = 1; }; name = Release; };
+		A10000000000000000000084 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGNING_ALLOWED = NO; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AppleSimulatorProbeUITests/Info.plist; PRODUCT_BUNDLE_IDENTIFIER = org.example.AppleSimulatorProbeUITests; PRODUCT_NAME = "$(TARGET_NAME)"; TARGETED_DEVICE_FAMILY = 1; TEST_TARGET_NAME = AppleSimulatorProbe; }; name = Debug; };
+		A10000000000000000000085 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGNING_ALLOWED = NO; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AppleSimulatorProbeUITests/Info.plist; PRODUCT_BUNDLE_IDENTIFIER = org.example.AppleSimulatorProbeUITests; PRODUCT_NAME = "$(TARGET_NAME)"; TARGETED_DEVICE_FAMILY = 1; TEST_TARGET_NAME = AppleSimulatorProbe; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A10000000000000000000061 /* Build configuration list for PBXNativeTarget "AppleSimulatorProbe" */ = {isa = XCConfigurationList; buildConfigurations = (A10000000000000000000082 /* Debug */, A10000000000000000000083 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+		A10000000000000000000062 /* Build configuration list for PBXNativeTarget "AppleSimulatorProbeUITests" */ = {isa = XCConfigurationList; buildConfigurations = (A10000000000000000000084 /* Debug */, A10000000000000000000085 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+		A10000000000000000000063 /* Build configuration list for PBXProject "AppleSimulatorProbe" */ = {isa = XCConfigurationList; buildConfigurations = (A10000000000000000000080 /* Debug */, A10000000000000000000081 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+/* End XCConfigurationList section */
+	};
+	rootObject = A10000000000000000000060 /* Project object */;
+}
