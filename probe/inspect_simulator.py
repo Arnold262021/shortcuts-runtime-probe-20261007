@@ -79,13 +79,6 @@ def choose_device(runtimes, devices, types):
     raise RuntimeError("IOS27_IPHONE_TEMPLATE_ABSENT")
 
 
-def require_booted(devices, device_id):
-    matches = [device for group in devices["devices"].values() for device in group
-               if device.get("udid", "").lower() == device_id.lower()]
-    if len(matches) != 1 or matches[0].get("state") != "Booted":
-        raise RuntimeError("FRESH_SIMULATOR_NOT_BOOTED")
-
-
 def validated_device_id(output):
     identifier = output.decode("ascii").strip()
     if str(uuid.UUID(identifier)).casefold() != identifier.casefold():
@@ -126,6 +119,14 @@ def diagnostic_command(args, filename, timeout=60, env=None, full=False, simulat
     return result
 
 
+def collect_xcode_diagnostic(receipt, name, args, simulator_id=None):
+    try:
+        result = diagnostic_command(args, name + ".txt", full=True, simulator_id=simulator_id)
+        receipt[name + "_diagnostic_exit"] = result.returncode
+    except subprocess.TimeoutExpired:
+        receipt[name + "_diagnostic_exit"] = "timeout"
+
+
 def cleanup_device(device_id):
     errors = []
     for action in ("shutdown", "delete"):
@@ -151,6 +152,7 @@ def main():
     receipt = {"scope": "fresh_account_free_simulator", "message_access": False,
                "otp_proven": False, "automation_created": False}
     try:
+        collect_xcode_diagnostic(receipt, "sdks", ["xcodebuild", "-showsdks"])
         runtime, device_type = choose_device(
             sim_json("list", "runtimes"), sim_json("list", "devices", "available"),
             sim_json("list", "devicetypes"))
@@ -159,17 +161,11 @@ def main():
                            device_type, runtime]).stdout
         device_id = validated_device_id(created)
         receipt["synthetic_simulator_id"] = device_id
+        collect_xcode_diagnostic(receipt, "destinations_preboot",
+                                 ["xcodebuild", *PROJECT_ARGS, "-showdestinations"], device_id)
         command(["xcrun", "simctl", "boot", device_id])
-        command(["xcrun", "simctl", "bootstatus", device_id, "-b"], timeout=300)
-        require_booted(sim_json("list", "devices"), device_id)
-        for name, args in (
-                ("sdks", ["xcodebuild", "-showsdks"]),
-                ("destinations", ["xcodebuild", *PROJECT_ARGS, "-showdestinations"])):
-            try:
-                result = diagnostic_command(args, name + ".txt", full=True, simulator_id=device_id)
-                receipt[name + "_diagnostic_exit"] = result.returncode
-            except subprocess.TimeoutExpired:
-                receipt[name + "_diagnostic_exit"] = "timeout"
+        boot_status = command(["xcrun", "simctl", "bootstatus", device_id, "-b"], timeout=300)
+        receipt["bootstatus_exit"] = boot_status.returncode
         bundle = "com.apple.shortcuts"
         receipt["shortcuts_bundle_candidate"] = bundle
         try:
