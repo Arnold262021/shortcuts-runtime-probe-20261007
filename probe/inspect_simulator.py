@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -30,10 +31,17 @@ def simulator_environment(source):
 
 SAFE_ENV = simulator_environment(os.environ)
 TIMINGS = []
+DEADLINE = None
+PROJECT_ARGS = ["-project", "AppleSimulatorProbe.xcodeproj", "-scheme", "AppleSimulatorProbe"]
 
 
-def command(args, timeout=60, check=True, env=None):
+def command(args, timeout=60, check=True, env=None, honor_budget=True):
     started = time.monotonic()
+    if honor_budget and DEADLINE is not None:
+        remaining = DEADLINE - started
+        if remaining <= 0:
+            raise RuntimeError("PROBE_BUDGET_EXHAUSTED")
+        timeout = min(timeout, remaining)
     stage = " ".join(args[:3])
     print(f"PROBE_COMMAND_START={stage}", flush=True)
     try:
@@ -78,11 +86,52 @@ def require_booted(devices, device_id):
         raise RuntimeError("FRESH_SIMULATOR_NOT_BOOTED")
 
 
+def validated_device_id(output):
+    identifier = output.decode("ascii").strip()
+    if str(uuid.UUID(identifier)).casefold() != identifier.casefold():
+        raise ValueError("NONCANONICAL_SIMULATOR_ID")
+    # Validate the UUID without changing the identifier returned by CoreSimulator.
+    return identifier
+
+
+def xcode_diagnostics(output, failed, simulator_id=None):
+    text = output.decode("utf-8", "replace")
+    text = text.replace(str(ROOT.parent), "<WORKSPACE>")
+    text = text.replace(os.environ.get("HOME", "/no-home"), "<HOME>")
+    def redact_identifier(match):
+        identifier = match.group(2)
+        if simulator_id and identifier.casefold() == simulator_id.casefold():
+            return match.group(0)
+        return match.group(1) + "<OTHER_RUNNER_DESTINATION>"
+    text = re.sub(r"(\bid\s*:\s*)([^,}\s]+)", redact_identifier, text, flags=re.IGNORECASE)
+    if not failed:
+        text = "\n".join(line for line in text.splitlines()
+                         if any(marker in line for marker in (
+                             "error:", "PROBE_", "Test Case", "TEST SUCCEEDED", "TEST FAILED")))
+    # A failure's destination lists are context, even without an "error:" marker.
+    return text[-65536:]
+
+
+def diagnostic_command(args, filename, timeout=60, env=None, full=False, simulator_id=None):
+    try:
+        result = command(args, timeout=timeout, check=False, env=env)
+    except subprocess.TimeoutExpired as error:
+        output = (error.stdout or b"") + (error.stderr or b"")
+        (ARTIFACTS / filename).write_text(
+            xcode_diagnostics(output, True, simulator_id), encoding="utf-8")
+        raise
+    (ARTIFACTS / filename).write_text(
+        xcode_diagnostics(result.stdout + result.stderr, full or result.returncode != 0,
+                          simulator_id), encoding="utf-8")
+    return result
+
+
 def cleanup_device(device_id):
     errors = []
     for action in ("shutdown", "delete"):
         try:
-            result = command(["xcrun", "simctl", action, device_id], timeout=30, check=False)
+            result = command(["xcrun", "simctl", action, device_id], timeout=30,
+                             check=False, honor_budget=False)
             if result.returncode:
                 errors.append(f"{action}:exit{result.returncode}")
         except (subprocess.TimeoutExpired, OSError):
@@ -91,9 +140,13 @@ def cleanup_device(device_id):
 
 
 def main():
+    global DEADLINE
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise RuntimeError("GITHUB_MACOS_RUNNER_REQUIRED")
     ARTIFACTS.mkdir(exist_ok=False)
+    TIMINGS.clear()
+    # Reserve three minutes of the job for bounded cleanup and artifact upload.
+    DEADLINE = time.monotonic() + 720
     device_id = None
     receipt = {"scope": "fresh_account_free_simulator", "message_access": False,
                "otp_proven": False, "automation_created": False}
@@ -103,11 +156,20 @@ def main():
             sim_json("list", "devicetypes"))
         receipt.update(runtime=runtime, device_type=device_type)
         created = command(["xcrun", "simctl", "create", "Synthetic-Shortcuts-Probe",
-                           device_type, runtime]).stdout.decode().strip()
-        device_id = str(uuid.UUID(created))
+                           device_type, runtime]).stdout
+        device_id = validated_device_id(created)
+        receipt["synthetic_simulator_id"] = device_id
         command(["xcrun", "simctl", "boot", device_id])
         command(["xcrun", "simctl", "bootstatus", device_id, "-b"], timeout=300)
         require_booted(sim_json("list", "devices"), device_id)
+        for name, args in (
+                ("sdks", ["xcodebuild", "-showsdks"]),
+                ("destinations", ["xcodebuild", *PROJECT_ARGS, "-showdestinations"])):
+            try:
+                result = diagnostic_command(args, name + ".txt", full=True, simulator_id=device_id)
+                receipt[name + "_diagnostic_exit"] = result.returncode
+            except subprocess.TimeoutExpired:
+                receipt[name + "_diagnostic_exit"] = "timeout"
         bundle = "com.apple.shortcuts"
         receipt["shortcuts_bundle_candidate"] = bundle
         try:
@@ -118,24 +180,18 @@ def main():
             receipt["before_screenshot_exit"] = "timeout"
         env = dict(SAFE_ENV, TEST_RUNNER_SHORTCUTS_BUNDLE_ID=bundle)
         result_path = ROOT.parent / "ProbeResults.xcresult"
-        build = command([
-            "xcodebuild", "test", "-project", "AppleSimulatorProbe.xcodeproj",
-            "-scheme", "AppleSimulatorProbe", "-destination", f"platform=iOS Simulator,id={device_id}",
+        build = diagnostic_command([
+            "xcodebuild", "test", *PROJECT_ARGS,
+            "-destination", f"platform=iOS Simulator,id={device_id}",
             "-derivedDataPath", str(ROOT.parent / "DerivedData"),
             "-resultBundlePath", str(result_path), "-parallel-testing-enabled", "NO",
             "-maximum-concurrent-test-simulator-destinations", "1",
             "-test-timeouts-enabled", "YES", "-default-test-execution-time-allowance", "120",
             "-maximum-test-execution-time-allowance", "180", "CODE_SIGNING_ALLOWED=NO"
-        ], timeout=480, check=False, env=env)
+        ], "test-diagnostics.txt", timeout=480, env=env, simulator_id=device_id)
         receipt["xcodebuild_exit"] = build.returncode
-        output = (build.stdout + build.stderr).decode("utf-8", "replace")
-        output = output.replace(str(ROOT.parent), "<WORKSPACE>")
-        output = output.replace(os.environ.get("HOME", "/no-home"), "<HOME>")
-        relevant = [line for line in output.splitlines()
-                    if "error:" in line or "PROBE_" in line
-                    or "Test Case" in line or "TEST SUCCEEDED" in line or "TEST FAILED" in line]
-        (ARTIFACTS / "test-diagnostics.txt").write_text("\n".join(relevant), encoding="utf-8")
-        print("\n".join(relevant[-80:]), flush=True)
+        diagnostics = (ARTIFACTS / "test-diagnostics.txt").read_text(encoding="utf-8")
+        print("\n".join(diagnostics.splitlines()[-80:]), flush=True)
         if result_path.exists():
             attachments = ROOT.parent / "ExportedAttachments"
             exported = command(["xcrun", "xcresulttool", "export", "attachments", "--path",
@@ -154,8 +210,8 @@ def main():
         return 0
     except (RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
         receipt["status"] = "blocked"
-        receipt["failure"] = str(error)
-        print(f"PROBE_FAILURE={error}", flush=True)
+        receipt["failure"] = "COMMAND_TIMEOUT" if isinstance(error, subprocess.TimeoutExpired) else str(error)
+        print("PROBE_FAILURE=" + receipt["failure"], flush=True)
         return 1
     finally:
         if device_id:
@@ -163,6 +219,7 @@ def main():
         receipt["command_timings"] = TIMINGS
         (ARTIFACTS / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
         print("PROBE_RECEIPT=" + json.dumps(receipt), flush=True)
+        DEADLINE = None
 
 
 if __name__ == "__main__":
