@@ -3,11 +3,11 @@
 import json
 import os
 from pathlib import Path
-import plistlib
 import shutil
 import subprocess
 import sys
 import uuid
+import time
 
 
 ROOT = Path(__file__).resolve().parent
@@ -15,11 +15,23 @@ ARTIFACTS = ROOT.parent / "artifacts"
 SAFE_ENV = {key: os.environ[key] for key in (
     "PATH", "HOME", "TMPDIR", "DEVELOPER_DIR", "LANG", "LC_ALL"
 ) if key in os.environ}
+TIMINGS = []
 
 
 def command(args, timeout=60, check=True, env=None):
-    result = subprocess.run(args, capture_output=True, timeout=timeout,
-                            env=env or SAFE_ENV, cwd=ROOT)
+    started = time.monotonic()
+    stage = " ".join(args[:3])
+    print(f"PROBE_COMMAND_START={stage}", flush=True)
+    try:
+        result = subprocess.run(args, capture_output=True, timeout=timeout,
+                                env=env or SAFE_ENV, cwd=ROOT)
+    except subprocess.TimeoutExpired:
+        TIMINGS.append({"command": stage, "seconds": round(time.monotonic() - started, 2),
+                        "timed_out": True})
+        raise
+    TIMINGS.append({"command": stage, "seconds": round(time.monotonic() - started, 2),
+                    "exit_code": result.returncode})
+    print("PROBE_COMMAND_END=" + json.dumps(TIMINGS[-1]), flush=True)
     if check and result.returncode:
         detail = result.stderr.decode("utf-8", "replace")[-3000:]
         detail = detail.replace(str(ROOT.parent), "<WORKSPACE>")
@@ -45,12 +57,11 @@ def choose_device(runtimes, devices, types):
     raise RuntimeError("IOS27_IPHONE_TEMPLATE_ABSENT")
 
 
-def find_shortcuts(apps):
-    candidates = [bundle for bundle, info in apps.items()
-                  if bundle == "com.apple.shortcuts"]
-    if len(candidates) != 1:
-        raise RuntimeError("SIMULATOR_SHORTCUTS_APP_ABSENT")
-    return candidates[0]
+def require_booted(devices, device_id):
+    matches = [device for group in devices["devices"].values() for device in group
+               if device.get("udid", "").lower() == device_id.lower()]
+    if len(matches) != 1 or matches[0].get("state") != "Booted":
+        raise RuntimeError("FRESH_SIMULATOR_NOT_BOOTED")
 
 
 def cleanup_device(device_id):
@@ -82,9 +93,15 @@ def main():
         device_id = str(uuid.UUID(created))
         command(["xcrun", "simctl", "boot", device_id])
         command(["xcrun", "simctl", "bootstatus", device_id, "-b"], timeout=300)
-        apps = plistlib.loads(command(["xcrun", "simctl", "listapps", device_id]).stdout)
-        bundle = find_shortcuts(apps)
-        receipt["shortcuts_bundle"] = bundle
+        require_booted(sim_json("list", "devices"), device_id)
+        bundle = "com.apple.shortcuts"
+        receipt["shortcuts_bundle_candidate"] = bundle
+        try:
+            before = command(["xcrun", "simctl", "io", device_id, "screenshot",
+                              str(ARTIFACTS / "before-ui-test.png")], timeout=20, check=False)
+            receipt["before_screenshot_exit"] = before.returncode
+        except subprocess.TimeoutExpired:
+            receipt["before_screenshot_exit"] = "timeout"
         env = dict(SAFE_ENV, TEST_RUNNER_SHORTCUTS_BUNDLE_ID=bundle)
         result_path = ROOT.parent / "ProbeResults.xcresult"
         build = command([
@@ -129,6 +146,7 @@ def main():
     finally:
         if device_id:
             receipt["cleanup_errors"] = cleanup_device(device_id)
+        receipt["command_timings"] = TIMINGS
         (ARTIFACTS / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
         print("PROBE_RECEIPT=" + json.dumps(receipt), flush=True)
 
