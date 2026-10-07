@@ -11,10 +11,7 @@ final class ShortcutsObservationTests: XCTestCase {
         guard let shortcuts else { return }
 
         capture(shortcuts, stage: "initial")
-        let onboarding = shortcuts.buttons.matching(NSPredicate(format: "label == %@", "Continue"))
-        if onboarding.count > 0 {
-            guard tapUnique(onboarding, in: shortcuts, stage: "continue-onboarding") else { return }
-        }
+        guard dismissShortcutsOnboardingIfPresent(in: shortcuts) else { return }
         guard tapUnique(
             shortcuts.buttons.matching(identifier: "main.button.newshortcut"),
             in: shortcuts,
@@ -58,6 +55,36 @@ final class ShortcutsObservationTests: XCTestCase {
     private func hasNamedControl(_ label: String, in application: XCUIApplication) -> Bool {
         let predicate = NSPredicate(format: "label == %@", label)
         return application.buttons.matching(predicate).count + application.cells.matching(predicate).count > 0
+    }
+
+    @MainActor
+    private func dismissShortcutsOnboardingIfPresent(in application: XCUIApplication) -> Bool {
+        let unified = application.staticTexts.matching(NSPredicate(format: "label == %@", "Unified Automations"))
+        let whatsNew = application.staticTexts.matching(NSPredicate(format: "label == %@", "What’s New in Shortcuts"))
+        let continueButtons = application.buttons.matching(NSPredicate(format: "label == %@", "Continue"))
+        let contextCount = unified.count + whatsNew.count
+        let continueCount = continueButtons.count
+        print("PROBE_STAGE=shortcuts-onboarding CONTEXT=\(contextCount) CONTINUE=\(continueCount)")
+        guard contextCount > 0 else { return true }
+        guard continueCount == 1 else {
+            return block(at: "shortcuts-onboarding", in: application, reason: "expected-one-continue")
+        }
+        return tapUnique(continueButtons, in: application, stage: "continue-shortcuts-onboarding")
+    }
+
+    @MainActor
+    private func dismissKeyboardOnboardingIfPresent(in application: XCUIApplication) -> Bool {
+        let onboardingText = "Speed up your typing by sliding your finger across the letters to compose a word."
+        let context = application.staticTexts.matching(NSPredicate(format: "label == %@", onboardingText))
+        let continueButtons = application.buttons.matching(NSPredicate(format: "label == %@", "Continue"))
+        let contextCount = context.count
+        let continueCount = continueButtons.count
+        print("PROBE_STAGE=keyboard-onboarding CONTEXT=\(contextCount) CONTINUE=\(continueCount)")
+        guard contextCount > 0 || continueCount > 0 else { return true }
+        guard contextCount == 1, continueCount == 1 else {
+            return block(at: "keyboard-onboarding", in: application, reason: "unexpected-onboarding-context")
+        }
+        return tapUnique(continueButtons, in: application, stage: "continue-keyboard-onboarding")
     }
 
     @MainActor
@@ -116,37 +143,50 @@ final class ShortcutsObservationTests: XCTestCase {
 
     @MainActor
     private func configureMessageContains(in application: XCUIApplication) -> Bool {
-        let directFields = application.textFields.matching(
-            NSPredicate(format: "label == %@ OR placeholderValue == %@", "Message Contains", "Message Contains")
+        let conditionContainers = application.otherElements.matching(
+            identifier: "editor.action.WFMessageTrigger.WFMessageConditions"
         )
-        let directTextViews = application.textViews.matching(
-            NSPredicate(format: "label == %@ OR placeholderValue == %@", "Message Contains", "Message Contains")
+        guard conditionContainers.count == 1 else {
+            return block(at: "message-condition-container", in: application, reason: "expected-one-container")
+        }
+        let container = conditionContainers.element(boundBy: 0)
+        let senderProperty = container.buttons.matching(
+            NSPredicate(format: "identifier == %@ AND value == %@", "enum", "Sender")
         )
-        if directFields.count + directTextViews.count == 0 {
-            let conditionContainers = application.otherElements.matching(
-                identifier: "editor.action.WFMessageTrigger.WFMessageConditions"
-            )
-            guard conditionContainers.count == 1 else {
-                return block(at: "message-condition-container", in: application, reason: "expected-one-container")
-            }
-            let propertySelectors = conditionContainers.element(boundBy: 0).buttons.matching(
-                NSPredicate(format: "identifier == %@ AND value == %@ AND identifier != %@",
-                            "enum", "Sender", "contact")
-            )
-            guard tapUnique(propertySelectors, in: application, stage: "message-filter-property-menu") else {
-                return false
-            }
-            guard tapNamedControl("Message Contains", in: application, stage: "message-contains-option") else {
-                return false
-            }
+        guard tapUnique(senderProperty, in: application, stage: "message-filter-property-menu") else {
+            return false
+        }
+        guard tapNamedControl("Message", in: application, stage: "message-filter-property") else {
+            return false
         }
 
-        let fields = application.textFields.matching(
-            NSPredicate(format: "label == %@ OR placeholderValue == %@", "Message Contains", "Message Contains")
+        let messageProperty = container.buttons.matching(
+            NSPredicate(format: "identifier == %@ AND value == %@", "enum", "Message")
         )
-        let textViews = application.textViews.matching(
-            NSPredicate(format: "label == %@ OR placeholderValue == %@", "Message Contains", "Message Contains")
-        )
+        guard messageProperty.count == 1 else {
+            return block(at: "message-filter-property-confirmation", in: application, reason: "value-message-not-observed")
+        }
+        let containsText = container.staticTexts.matching(NSPredicate(format: "label == %@", "contains"))
+        let containsButtons = container.buttons.matching(NSPredicate(format: "label == %@", "contains"))
+        let containsCells = container.cells.matching(NSPredicate(format: "label == %@", "contains"))
+        let containsCount = containsText.count + containsButtons.count + containsCells.count
+        print("PROBE_STAGE=message-contains-operator COUNT=\(containsCount)")
+        guard containsCount >= 1 else {
+            return block(at: "message-contains-operator", in: application, reason: "contains-not-observed")
+        }
+
+        var fields = container.textFields
+        var textViews = container.textViews
+        if fields.count + textViews.count == 0 {
+            let textControl = container.buttons.matching(
+                NSPredicate(format: "label == %@ AND identifier != %@ AND identifier != %@", "Text", "enum", "contact")
+            )
+            guard tapUnique(textControl, in: application, stage: "message-condition-text-editor-hypothesis") else {
+                return false
+            }
+            fields = container.textFields
+            textViews = container.textViews
+        }
         let field = fields.element(boundBy: 0)
         let textView = textViews.element(boundBy: 0)
         waitForMatches(fields, textViews)
@@ -156,13 +196,14 @@ final class ShortcutsObservationTests: XCTestCase {
         let total = fieldCount + textViewCount
         print("PROBE_STAGE=message-contains FIELDS=\(fieldCount) TEXTVIEWS=\(textViewCount)")
         guard total == 1 else {
-            return block(at: "message-contains", in: application, reason: "expected-one-exact-filter-field-found-\(total)")
+            return block(at: "message-contains", in: application, reason: "expected-one-container-descendant-field-found-\(total)")
         }
 
         let target = fieldCount == 1 ? field : textView
         guard target.isHittable else {
             return block(at: "message-contains", in: application, reason: "filter-not-hittable")
         }
+        guard dismissKeyboardOnboardingIfPresent(in: application) else { return false }
         target.tap()
         target.typeText(syntheticPhrase)
         settle()

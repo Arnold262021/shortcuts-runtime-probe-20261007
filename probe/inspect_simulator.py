@@ -123,8 +123,16 @@ def collect_xcode_diagnostic(receipt, name, args, simulator_id=None):
     try:
         result = diagnostic_command(args, name + ".txt", full=True, simulator_id=simulator_id)
         receipt[name + "_diagnostic_exit"] = result.returncode
+        return result
     except subprocess.TimeoutExpired:
         receipt[name + "_diagnostic_exit"] = "timeout"
+        return None
+
+
+def test_diagnostic_options(help_text):
+    if re.search(r"(?m)^\s*-collect-test-diagnostics(?:\s|$)", help_text):
+        return ["-collect-test-diagnostics", "never"]
+    return []
 
 
 def cleanup_device(device_id):
@@ -153,6 +161,11 @@ def main():
                "otp_proven": False, "automation_created": False}
     try:
         collect_xcode_diagnostic(receipt, "sdks", ["xcodebuild", "-showsdks"])
+        help_result = collect_xcode_diagnostic(receipt, "xcode_help", ["xcodebuild", "-help"])
+        help_text = ((help_result.stdout + help_result.stderr).decode("utf-8", "replace")
+                     if help_result is not None else "")
+        diagnostic_options = test_diagnostic_options(help_text)
+        receipt["system_diagnostics_policy"] = "never" if diagnostic_options else "default"
         runtime, device_type = choose_device(
             sim_json("list", "runtimes"), sim_json("list", "devices", "available"),
             sim_json("list", "devicetypes"))
@@ -183,7 +196,8 @@ def main():
             "-resultBundlePath", str(result_path), "-parallel-testing-enabled", "NO",
             "-maximum-concurrent-test-simulator-destinations", "1",
             "-test-timeouts-enabled", "YES", "-default-test-execution-time-allowance", "120",
-            "-maximum-test-execution-time-allowance", "180", "CODE_SIGNING_ALLOWED=NO"
+            "-maximum-test-execution-time-allowance", "180", *diagnostic_options,
+            "CODE_SIGNING_ALLOWED=NO"
         ]
         try:
             build = diagnostic_command(build_args, "test-diagnostics.txt", timeout=480,
