@@ -1,0 +1,37 @@
+name: Shortcuts Runtime Presence
+
+"on":
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  presence:
+    runs-on: xcode-27
+    timeout-minutes: 5
+    steps:
+      - name: Inspect installed Shortcuts tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          os_version="$(/usr/bin/sw_vers -productVersion)"
+          printf 'MACOS_VERSION=%s\n' "$os_version"
+          case "$os_version" in
+            27.*) ;;
+            *) printf 'PREFLIGHT=UNEXPECTED_OS_VERSION\n'; exit 10 ;;
+          esac
+
+          app='/System/Applications/Shortcuts.app'
+          if [[ ! -d "$app" ]]; then
+            printf 'PREFLIGHT=SHORTCUTS_APP_ABSENT\n'
+            exit 11
+          fi
+          if [[ ! -x /usr/bin/shortcuts ]]; then
+            printf 'PREFLIGHT=SHORTCUTS_CLI_ABSENT\n'
+            exit 12
+          fi
+
+          /usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist"
+          /usr/bin/shortcuts --help
+          printf 'PREFLIGHT=TOOLS_PRESENT_ONLY\n'
