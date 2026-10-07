@@ -9,6 +9,8 @@ import subprocess
 import sys
 import uuid
 import time
+import signal
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parent
@@ -35,6 +37,53 @@ DEADLINE = None
 PROJECT_ARGS = ["-project", "AppleSimulatorProbe.xcodeproj", "-scheme", "AppleSimulatorProbe"]
 
 
+def run_with_timeout(args, timeout, env):
+    # Files avoid waiting for pipe EOF from descendants after the parent exits.
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        process = subprocess.Popen(args, stdout=stdout, stderr=stderr, env=env,
+                                   cwd=ROOT, start_new_session=True)
+        timed_out = False
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        stdout.seek(0)
+        stderr.seek(0)
+        output, error = stdout.read(), stderr.read()
+        if timed_out:
+            raise subprocess.TimeoutExpired(args, timeout, output=output, stderr=error)
+        return subprocess.CompletedProcess(args, process.returncode, output, error)
+
+
+def native_timeout_probe():
+    script = ("import os,time\n"
+              "child = os.fork()\n"
+              "if child:\n"
+              " print('GRANDCHILD_STARTED', flush=True)\n"
+              "time.sleep(30)\n")
+    started = time.monotonic()
+    marker_seen = False
+    timed_out = False
+    try:
+        run_with_timeout([sys.executable, "-c", script], timeout=1, env=SAFE_ENV)
+    except subprocess.TimeoutExpired as error:
+        timed_out = True
+        marker_seen = b"GRANDCHILD_STARTED" in (error.stdout or b"")
+    elapsed = time.monotonic() - started
+    return {"wrapper_return_bounded_with_descendant_present":
+            timed_out and marker_seen and elapsed < 8,
+            "descendant_marker_seen": marker_seen,
+            "seconds": round(elapsed, 3)}
+
+
 def command(args, timeout=60, check=True, env=None, honor_budget=True):
     started = time.monotonic()
     if honor_budget and DEADLINE is not None:
@@ -45,8 +94,7 @@ def command(args, timeout=60, check=True, env=None, honor_budget=True):
     stage = " ".join(args[:3])
     print(f"PROBE_COMMAND_START={stage}", flush=True)
     try:
-        result = subprocess.run(args, capture_output=True, timeout=timeout,
-                                env=env or SAFE_ENV, cwd=ROOT)
+        result = run_with_timeout(args, timeout=timeout, env=env or SAFE_ENV)
     except subprocess.TimeoutExpired:
         TIMINGS.append({"command": stage, "seconds": round(time.monotonic() - started, 2),
                         "timed_out": True})
@@ -160,6 +208,10 @@ def main():
     receipt = {"scope": "fresh_account_free_simulator", "message_access": False,
                "otp_proven": False, "automation_created": False}
     try:
+        receipt["native_timeout_probe"] = native_timeout_probe()
+        print("PROBE_NATIVE_TIMEOUT=" + json.dumps(receipt["native_timeout_probe"]), flush=True)
+        if not receipt["native_timeout_probe"]["wrapper_return_bounded_with_descendant_present"]:
+            raise RuntimeError("NATIVE_TIMEOUT_PROBE_UNCONFIRMED")
         collect_xcode_diagnostic(receipt, "sdks", ["xcodebuild", "-showsdks"])
         help_result = collect_xcode_diagnostic(receipt, "xcode_help", ["xcodebuild", "-help"])
         help_text = ((help_result.stdout + help_result.stderr).decode("utf-8", "replace")
