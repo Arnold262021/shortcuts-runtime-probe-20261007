@@ -123,6 +123,19 @@ final class ShortcutsObservationTests: XCTestCase {
             NSPredicate(format: "label == %@ OR placeholderValue == %@", "Message Contains", "Message Contains")
         )
         if directFields.count + directTextViews.count == 0 {
+            let conditionContainers = application.otherElements.matching(
+                identifier: "editor.action.WFMessageTrigger.WFMessageConditions"
+            )
+            guard conditionContainers.count == 1 else {
+                return block(at: "message-condition-container", in: application, reason: "expected-one-container")
+            }
+            let propertySelectors = conditionContainers.element(boundBy: 0).buttons.matching(
+                NSPredicate(format: "identifier == %@ AND value == %@ AND identifier != %@",
+                            "enum", "Sender", "contact")
+            )
+            guard tapUnique(propertySelectors, in: application, stage: "message-filter-property-menu") else {
+                return false
+            }
             guard tapNamedControl("Message Contains", in: application, stage: "message-contains-option") else {
                 return false
             }

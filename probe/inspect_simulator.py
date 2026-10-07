@@ -176,7 +176,7 @@ def main():
             receipt["before_screenshot_exit"] = "timeout"
         env = dict(SAFE_ENV, TEST_RUNNER_SHORTCUTS_BUNDLE_ID=bundle)
         result_path = ROOT.parent / "ProbeResults.xcresult"
-        build = diagnostic_command([
+        build_args = [
             "xcodebuild", "test", *PROJECT_ARGS,
             "-destination", f"platform=iOS Simulator,id={device_id}",
             "-derivedDataPath", str(ROOT.parent / "DerivedData"),
@@ -184,23 +184,36 @@ def main():
             "-maximum-concurrent-test-simulator-destinations", "1",
             "-test-timeouts-enabled", "YES", "-default-test-execution-time-allowance", "120",
             "-maximum-test-execution-time-allowance", "180", "CODE_SIGNING_ALLOWED=NO"
-        ], "test-diagnostics.txt", timeout=480, env=env, simulator_id=device_id)
-        receipt["xcodebuild_exit"] = build.returncode
+        ]
+        try:
+            build = diagnostic_command(build_args, "test-diagnostics.txt", timeout=480,
+                                       env=env, simulator_id=device_id)
+            receipt["xcodebuild_exit"] = build.returncode
+        except subprocess.TimeoutExpired:
+            receipt["xcodebuild_exit"] = "timeout"
         diagnostics = (ARTIFACTS / "test-diagnostics.txt").read_text(encoding="utf-8")
         print("\n".join(diagnostics.splitlines()[-80:]), flush=True)
         if result_path.exists():
             attachments = ROOT.parent / "ExportedAttachments"
-            exported = command(["xcrun", "xcresulttool", "export", "attachments", "--path",
-                                str(result_path), "--output-path", str(attachments)],
-                               timeout=60, check=False)
-            receipt["attachment_export_exit"] = exported.returncode
+            try:
+                exported = command(["xcrun", "xcresulttool", "export", "attachments", "--path",
+                                    str(result_path), "--output-path", str(attachments)],
+                                   timeout=60, check=False)
+                receipt["attachment_export_exit"] = exported.returncode
+            except (subprocess.TimeoutExpired, RuntimeError):
+                receipt["attachment_export_exit"] = "unconfirmed"
             for index, file in enumerate(sorted(attachments.rglob("*"))):
                 if file.is_file() and file.suffix.lower() in (".txt", ".png"):
                     shutil.copyfile(file, ARTIFACTS / f"ui-{index}{file.suffix.lower()}")
-        screen = command(["xcrun", "simctl", "io", device_id, "screenshot",
-                          str(ARTIFACTS / "last-screen.png")], check=False)
-        receipt["last_screenshot_exit"] = screen.returncode
-        if build.returncode:
+        try:
+            screen = command(["xcrun", "simctl", "io", device_id, "screenshot",
+                              str(ARTIFACTS / "last-screen.png")], check=False)
+            receipt["last_screenshot_exit"] = screen.returncode
+        except (subprocess.TimeoutExpired, RuntimeError):
+            receipt["last_screenshot_exit"] = "unconfirmed"
+        if receipt["xcodebuild_exit"] == "timeout":
+            raise RuntimeError("UI_TEST_COMMAND_TIMEOUT")
+        if receipt["xcodebuild_exit"] != 0:
             raise RuntimeError("UI_TEST_FAILED")
         receipt["status"] = "UI_TEST_PASSED_ONLY"
         return 0
