@@ -12,9 +12,23 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 ARTIFACTS = ROOT.parent / "artifacts"
-SAFE_ENV = {key: os.environ[key] for key in (
-    "PATH", "HOME", "TMPDIR", "DEVELOPER_DIR", "LANG", "LC_ALL"
-) if key in os.environ}
+def simulator_environment(source):
+    blocked_prefixes = (
+        "GITHUB_", "GH_", "ACTIONS_", "RUNNER_", "CI_", "AWS_", "AZURE_",
+        "ARM_", "GOOGLE_", "GCLOUD_", "CLOUDFLARE_", "SSH_", "DYLD_", "LD_",
+        "GIT_CONFIG_"
+    )
+    blocked_words = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL",
+                     "COOKIE", "AUTH", "API_KEY", "PRIVATE_KEY")
+    blocked_names = {"BASH_ENV", "ENV", "CDPATH", "GIT_ASKPASS", "GPG_AGENT_INFO",
+                     "PYTHONPATH", "PYTHONHOME", "RUBYOPT", "PERL5OPT", "NODE_OPTIONS"}
+    return {key: source[key] for key in source
+            if not key.upper().startswith(blocked_prefixes)
+            and not any(word in key.upper() for word in blocked_words)
+            and key.upper() not in blocked_names}
+
+
+SAFE_ENV = simulator_environment(os.environ)
 TIMINGS = []
 
 
