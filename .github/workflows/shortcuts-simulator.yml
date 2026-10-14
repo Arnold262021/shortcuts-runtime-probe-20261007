@@ -20,7 +20,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Inspect fresh simulator
-        run: python3 probe/inspect_simulator.py
+        run: |
+          python3 -m unittest discover -s probe -p 'test_native_artifact.py' -q
+          python3 probe/inspect_simulator.py
       - name: Preserve synthetic UI evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -30,5 +32,6 @@ jobs:
             artifacts/*.json
             artifacts/*.txt
             artifacts/*.png
+            artifacts/*.shortcut
           retention-days: 1
           if-no-files-found: warn

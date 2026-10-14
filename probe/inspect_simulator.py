@@ -196,6 +196,26 @@ def cleanup_device(device_id):
     return errors
 
 
+def collect_native_export(device_id):
+    result = command(["xcrun", "simctl", "get_app_container", device_id,
+                      "com.apple.shortcuts", "data"], timeout=20)
+    try:
+        container = Path(result.stdout.decode("utf-8", "strict").strip()).resolve(strict=True)
+        own_device = (Path.home() / "Library" / "Developer" / "CoreSimulator" /
+                      "Devices" / device_id / "data").resolve(strict=True)
+    except (OSError, UnicodeDecodeError) as error:
+        raise RuntimeError("NATIVE_EXPORT_CONTAINER_UNCONFIRMED") from error
+    if not container.is_relative_to(own_device) or container == own_device:
+        raise RuntimeError("EXPORT_CONTAINER_OUTSIDE_OWN_SIMULATOR")
+    script = ("import sys; from pathlib import Path; from native_artifact import collect_shortcut_artifact; "
+              "collect_shortcut_artifact(Path(sys.argv[1]), Path(sys.argv[2]))")
+    collected = command([sys.executable, "-c", script, str(container), str(ARTIFACTS)],
+                        timeout=30, check=False)
+    if collected.returncode:
+        raise RuntimeError("NATIVE_SHORTCUT_ARTIFACT_UNCONFIRMED")
+    return json.loads((ARTIFACTS / "synthetic.shortcut.receipt.json").read_text(encoding="utf-8"))
+
+
 def main():
     global DEADLINE
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
@@ -282,6 +302,9 @@ def main():
         if receipt["xcodebuild_exit"] != 0:
             raise RuntimeError("UI_TEST_FAILED")
         receipt["status"] = "UI_TEST_PASSED_ONLY"
+        if "PROBE_FILE_EXPORT_UI_ATTEMPTED=true" in diagnostics:
+            receipt["native_artifact"] = collect_native_export(device_id)
+            receipt["status"] = "NATIVE_ARTIFACT_COLLECTED_ONLY"
         return 0
     except (RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
         receipt["status"] = "blocked"

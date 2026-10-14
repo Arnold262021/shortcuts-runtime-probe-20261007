@@ -51,10 +51,51 @@ final class ShortcutsObservationTests: XCTestCase {
             stage: "shortcut-share-options"
         ) else { return }
         print("PROBE_SHARE_OPTIONS_OBSERVED=true")
-        guard tapNamedControl("Options ", in: shortcuts, stage: "share-format-options") else { return }
+        guard tapObservedShareOptions(in: shortcuts) else { return }
         guard tapNamedControl("File", in: shortcuts, stage: "share-format-file") else { return }
         print("PROBE_FILE_CONTROL_TAPPED=true")
+        guard tapNamedControl("Done", in: shortcuts, stage: "finish-file-options") else { return }
+        print("PROBE_FILE_EXPORT_UI_ATTEMPTED=true")
         print("PROBE_NO_RUN_OR_NETWORK_CODE=true")
+    }
+
+    @MainActor
+    private func tapObservedShareOptions(in application: XCUIApplication) -> Bool {
+        let popovers = application.popovers
+        let popover = popovers.element(boundBy: 0)
+        guard popover.waitForExistence(timeout: stageTimeout), popovers.count == 1 else {
+            return block(at: "share-format-options", in: application, reason: "expected-one-share-popover")
+        }
+        guard popover.otherElements.matching(identifier: "ActivityListView").count == 1 else {
+            return block(at: "share-format-options", in: application, reason: "share-context-not-confirmed")
+        }
+        let options = popover.buttons.matching(NSPredicate(format: "label == %@", "Options "))
+        waitForMatches(options, application.cells.matching(NSPredicate(value: false)))
+        guard options.count == 1 else {
+            return block(at: "share-format-options", in: application, reason: "expected-one-options-button")
+        }
+        let target = options.element(boundBy: 0)
+        let deadline = Date().addingTimeInterval(stageTimeout)
+        while !target.isHittable && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+        if target.isHittable {
+            target.tap()
+        } else {
+            let frame = target.frame
+            let appFrame = application.frame
+            guard target.exists, target.isEnabled, !frame.isEmpty, !frame.isNull,
+                  !frame.isInfinite, popover.frame.contains(frame), appFrame.contains(frame) else {
+                return block(at: "share-format-options", in: application, reason: "options-frame-not-confirmed")
+            }
+            // The observed remote share view can report a visible button as non-hittable.
+            application.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+                .withOffset(CGVector(dx: frame.midX - appFrame.minX, dy: frame.midY - appFrame.minY)).tap()
+            print("PROBE_SHARE_OPTIONS_COORDINATE_TAP=true")
+        }
+        settle()
+        capture(application, stage: "share-format-options")
+        return true
     }
 
     @MainActor
@@ -151,6 +192,10 @@ final class ShortcutsObservationTests: XCTestCase {
         }
 
         let target = buttonCount == 1 ? button : cell
+        let hittableDeadline = Date().addingTimeInterval(stageTimeout)
+        while !target.isHittable && Date() < hittableDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
         guard target.isHittable else {
             return block(at: stage, in: application, reason: "control-not-hittable")
         }
