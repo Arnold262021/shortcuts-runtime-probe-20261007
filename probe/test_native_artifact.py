@@ -24,6 +24,17 @@ class ShortcutArtifactCollectionTests(unittest.TestCase):
         root.mkdir()
         return temporary, root, base / "artifacts"
 
+    @staticmethod
+    def lexical_alias(root: Path) -> Path:
+        alias_parent = root.parent / "lexical-alias"
+        alias_parent.mkdir()
+        return alias_parent / ".." / root.name
+
+    @staticmethod
+    def canonical_key(path: Path) -> str:
+        # Keep this comparison independent from the patched Path.stat below.
+        return os.path.normcase(os.path.realpath(os.fspath(path)))
+
     def test_collects_single_valid_export_with_identical_bytes_and_hash(self) -> None:
         temporary, root, artifacts = self.make_root()
         self.addCleanup(temporary.cleanup)
@@ -66,13 +77,14 @@ class ShortcutArtifactCollectionTests(unittest.TestCase):
     def test_rejects_preexisting_export_when_birthtime_precedes_boundary(self) -> None:
         temporary, root, artifacts = self.make_root()
         self.addCleanup(temporary.cleanup)
-        source = root / "old.shortcut"
+        source = self.lexical_alias(root) / "old.shortcut"
         source.write_bytes(b"AEA1old")
+        source_key = self.canonical_key(source)
         actual_stat = source.stat()
         original_stat = Path.stat
 
         def stat_with_old_birthtime(path: Path, *args: object, **kwargs: object):
-            if path == source:
+            if self.canonical_key(path) == source_key:
                 return SimpleNamespace(
                     st_size=actual_stat.st_size,
                     st_mode=actual_stat.st_mode,
@@ -87,13 +99,14 @@ class ShortcutArtifactCollectionTests(unittest.TestCase):
     def test_accepts_recent_export_and_records_birthtime(self) -> None:
         temporary, root, artifacts = self.make_root()
         self.addCleanup(temporary.cleanup)
-        source = root / "new.shortcut"
+        source = self.lexical_alias(root) / "new.shortcut"
         source.write_bytes(b"AEA1new")
+        source_key = self.canonical_key(source)
         actual_stat = source.stat()
         original_stat = Path.stat
 
         def stat_with_recent_birthtime(path: Path, *args: object, **kwargs: object):
-            if path == source:
+            if self.canonical_key(path) == source_key:
                 return SimpleNamespace(
                     st_size=actual_stat.st_size,
                     st_mode=actual_stat.st_mode,
@@ -109,13 +122,14 @@ class ShortcutArtifactCollectionTests(unittest.TestCase):
     def test_rejects_missing_birthtime_when_boundary_is_required(self) -> None:
         temporary, root, artifacts = self.make_root()
         self.addCleanup(temporary.cleanup)
-        source = root / "unknown-birthtime.shortcut"
+        source = self.lexical_alias(root) / "unknown-birthtime.shortcut"
         source.write_bytes(b"AEA1unknown")
+        source_key = self.canonical_key(source)
         actual_stat = source.stat()
         original_stat = Path.stat
 
         def stat_without_birthtime(path: Path, *args: object, **kwargs: object):
-            if path == source:
+            if self.canonical_key(path) == source_key:
                 return SimpleNamespace(
                     st_size=actual_stat.st_size,
                     st_mode=actual_stat.st_mode,
