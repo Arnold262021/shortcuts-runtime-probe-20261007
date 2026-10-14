@@ -40,7 +40,7 @@ class ShortcutArtifactCollectionTests(unittest.TestCase):
     def test_buffers_source_once_before_writing_artifact_and_receipt(self) -> None:
         temporary, root, artifacts = self.make_root()
         self.addCleanup(temporary.cleanup)
-        source = root / "changing.shortcut"
+        source = root / ".." / root.name / "changing.shortcut"
         first_payload = b"AEA1first-observation"
         source.write_bytes(first_payload)
         original_open = Path.open
@@ -49,7 +49,7 @@ class ShortcutArtifactCollectionTests(unittest.TestCase):
         def mutate_on_second_source_read(path: Path, *args: object, **kwargs: object):
             nonlocal source_reads
             mode = args[0] if args else kwargs.get("mode", "r")
-            if path == source and mode == "rb":
+            if path.resolve() == source.resolve() and mode == "rb":
                 source_reads += 1
                 if source_reads == 2:
                     source.write_bytes(b"AEA1later-content")
