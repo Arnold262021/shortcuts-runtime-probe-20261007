@@ -18,6 +18,13 @@ final class ShortcutsObservationTests: XCTestCase {
             stage: "new-shortcut"
         ) else { return }
         if !hasNamedControl("Automation", in: shortcuts) {
+            let editorMode = shortcuts.navigationBars.matching(identifier: "New Shortcut")
+                .buttons.matching(NSPredicate(format: "label == %@", "Editor"))
+            if editorMode.count > 0 {
+                guard tapUnique(editorMode, in: shortcuts, stage: "switch-to-action-editor") else { return }
+            }
+        }
+        if !hasNamedControl("Automation", in: shortcuts) {
             guard tapNamedControl("Edit", in: shortcuts, stage: "edit-shortcut") else { return }
         }
         guard tapNamedControl("Automation", in: shortcuts, stage: "automation") else { return }
