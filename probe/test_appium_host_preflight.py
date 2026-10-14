@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import json
 import os
 from pathlib import Path
+import plistlib
+import tempfile
 import unittest
 from unittest import mock
 
@@ -194,6 +196,174 @@ class AppiumHostPreflightTests(unittest.TestCase):
             self.assertTrue(preflight._cleanup(process))
         self.assertEqual(killpg.call_args_list, [mock.call(1234, preflight.signal.SIGTERM),
                                                 mock.call(1234, 9)])
+
+    def _exercise_wda(self, *, changed=False, bad_output=False, bad_install=False,
+                      private_version=False, escape=False, build_failure=None, wrong_bundle=False):
+        seen = []
+        simctl_calls = 0
+
+        def command(args, **kwargs):
+            nonlocal simctl_calls
+            seen.append((args, kwargs))
+            env = kwargs["env"]
+            root = Path(env["APPIUM_HOME"]).parent
+            if args == ["node", "--version"]:
+                stdout = b"v22.14.0"
+            elif args == ["npm", "--version"]:
+                stdout = b"10.9.2"
+            elif "--help" in args:
+                stdout = b"driver install list --installed --json"
+            elif "--version" in args:
+                stdout = b"3.8.0"
+            elif args[0] == "node" and args[1] == "-e":
+                package = Path("/outside/SENTINEL") if escape else (
+                    root / "driver" / "node_modules" / "appium-webdriveragent" / "package.json")
+                stdout = json.dumps({"resolvedPath": str(package)}).encode()
+            elif args[0] == "xcrun":
+                simctl_calls += 1
+                state = "Booted" if changed and simctl_calls == 2 else "Shutdown"
+                stdout = json.dumps({"devices": {"runtime": [{"udid": "opaque-id", "state": state}]}}).encode()
+            elif args[0] == "xcodebuild":
+                derived = Path(args[args.index("-derivedDataPath") + 1])
+                if not bad_output:
+                    products = derived / "Build" / "Products"
+                    runner = products / "Debug-iphonesimulator" / "WebDriverAgentRunner-Runner.app"
+                    bundle = runner / "PlugIns" / "WebDriverAgentRunner.xctest"
+                    bundle.mkdir(parents=True)
+                    (runner / "Info.plist").write_bytes(plistlib.dumps({"CFBundleExecutable": "WebDriverAgentRunner-Runner"}))
+                    (runner / "WebDriverAgentRunner-Runner").write_bytes(b"\xcf\xfa\xed\xfecompiled")
+                    bundle_path = "__TESTROOT__/Unrelated.xctest" if wrong_bundle else (
+                        "__TESTHOST__/PlugIns/WebDriverAgentRunner.xctest")
+                    if wrong_bundle:
+                        (products / "Unrelated.xctest").mkdir()
+                    (products / "Runner.xctestrun").write_bytes(plistlib.dumps({"WebDriverAgentRunner": {
+                        "TestBundlePath": bundle_path,
+                        "TestHostPath": "__TESTROOT__/Debug-iphonesimulator/WebDriverAgentRunner-Runner.app",
+                    }}))
+                if build_failure is not None:
+                    return SimpleNamespace(returncode=65, stdout=build_failure, stderr=b"PRIVATE_STDERR")
+                stdout = b""
+            elif "--json" in args:
+                install = root / "driver"
+                if not bad_install:
+                    package = install / "node_modules" / "appium-webdriveragent"
+                    (package / "WebDriverAgent.xcodeproj").mkdir(parents=True)
+                    (package / "WebDriverAgent.xcodeproj" / "project.pbxproj").write_text("", encoding="ascii")
+                    version = "PRIVATE_VERSION" if private_version else "16.15.0"
+                    (package / "package.json").write_text(
+                        json.dumps({"name": "appium-webdriveragent", "version": version}), encoding="ascii")
+                stdout = json.dumps({"xcuitest": {"pkgName": "appium-xcuitest-driver", "version": "12.18.1", "installed": True,
+                                                   "installPath": str(install)}}).encode()
+            else:
+                stdout = b""
+            return SimpleNamespace(returncode=0, stdout=stdout)
+
+        with mock.patch.object(preflight.sys, "platform", "darwin"), \
+                mock.patch.dict(preflight.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                mock.patch.object(preflight.subprocess, "Popen") as popen:
+            try:
+                result = preflight.run_appium_wda_build_preflight(command, {"PATH": os.environ["PATH"]})
+            except preflight.AppiumHostPreflightError as error:
+                result = error
+        return result, seen, popen
+
+    def test_wda_build_only_positive_has_no_server_session_or_boot(self):
+        result, seen, popen = self._exercise_wda()
+        self.assertEqual(result["status"], "HOST_WDA_COMPILED_ONLY")
+        self.assertEqual(result["build_exit"], 0)
+        for key in ("runner_bundle_verified", "xctestrun_verified", "simulator_state_unchanged", "cleanup_exited"):
+            self.assertTrue(result[key])
+        self.assertEqual(result["wda_package_version"], "16.15.0")
+        self.assertRegex(result["wda_package_sha256"], r"^[0-9a-f]{64}$")
+        popen.assert_not_called()
+        commands = [args for args, _ in seen]
+        self.assertEqual(sum(args[:2] == ["xcrun", "simctl"] for args in commands), 2)
+        self.assertEqual(sum(args[0] == "xcodebuild" for args in commands), 1)
+        build = next(args for args in commands if args[0] == "xcodebuild")
+        self.assertIn("build-for-testing", build)
+        self.assertIn("generic/platform=iOS Simulator", build)
+        self.assertIn("CODE_SIGNING_ALLOWED=NO", build)
+        self.assertNotIn("server", str(commands))
+        self.assertNotIn("session", str(commands).lower())
+        self.assertNotIn("boot", str(commands).lower())
+
+    def test_wda_build_rejects_state_change_and_missing_owned_metadata_or_outputs(self):
+        changed, _, popen = self._exercise_wda(changed=True)
+        self.assertEqual(changed.code, "HOST_WDA_SIMULATOR_STATE_CHANGED")
+        popen.assert_not_called()
+        for kwargs, code in (({"bad_install": True}, "HOST_WDA_DRIVER_METADATA"),
+                             ({"bad_output": True}, "HOST_WDA_OUTPUT"),
+                             ({"private_version": True}, "HOST_WDA_PACKAGE"),
+                             ({"escape": True}, "HOST_WDA_PACKAGE"),
+                             ({"wrong_bundle": True}, "HOST_WDA_OUTPUT")):
+            with self.subTest(kwargs=kwargs):
+                result, _, popen = self._exercise_wda(**kwargs)
+                self.assertEqual(result.code, code)
+                popen.assert_not_called()
+
+    def test_wda_build_failure_is_sanitized_and_classified(self):
+        result, _, popen = self._exercise_wda(
+            build_failure=b"Unable to find a destination matching the provided destination specifier PRIVATE_STDOUT")
+        self.assertEqual(result.code, "HOST_WDA_BUILD")
+        self.assertEqual(result.build_exit, 65)
+        self.assertEqual(result.build_failure_category, "destination_not_supported")
+        self.assertEqual(result.build_stdout_bytes, len(
+            b"Unable to find a destination matching the provided destination specifier PRIVATE_STDOUT"))
+        self.assertNotIn("PRIVATE", str(result))
+        self.assertRegex(result.build_stdout_sha256, r"^[0-9a-f]{64}$")
+        popen.assert_not_called()
+
+    def test_wda_build_progress_or_unclassified_failure_stays_unknown(self):
+        for output in (b"CompileC normal progress", b"PRIVATE_OTHER_FAILURE"):
+            with self.subTest(output=output):
+                result, _, _ = self._exercise_wda(build_failure=output)
+                self.assertEqual(result.code, "HOST_WDA_BUILD")
+                self.assertEqual(result.build_failure_category, "unknown")
+
+    def test_owned_regular_rejects_lexical_escape_and_accepts_canonical_ancestry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            root.mkdir()
+            outside = base / "outside"
+            outside.write_text("sentinel", encoding="ascii")
+            self.assertFalse(preflight._owned_regular(root / "nested" / ".." / ".." / "outside", root, directory=False))
+            inside = root / "inside"
+            inside.write_text("ok", encoding="ascii")
+            self.assertTrue(preflight._owned_regular(root.resolve() / "inside", root, directory=False))
+
+    def test_owned_regular_rejects_internal_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            root.mkdir()
+            outside = base / "outside"
+            outside.write_text("sentinel", encoding="ascii")
+            linked = root / "linked"
+            try:
+                os.symlink(outside, linked)
+            except (NotImplementedError, OSError):
+                self.skipTest("symlink creation unavailable")
+            self.assertFalse(preflight._owned_regular(linked, root, directory=False))
+
+    def test_macho_accepts_fat_headers_and_reads_only_the_header(self):
+        for header in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"):
+            self.assertTrue(preflight._valid_macho_header(header))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "large-bin"
+            executable.write_bytes(b"\xca\xfe\xba\xbe" + b"x" * (preflight._JSON_LIMIT + 1))
+            original_read = preflight.os.read
+            with mock.patch.object(preflight.os, "read", wraps=original_read) as read:
+                self.assertTrue(preflight._owned_macho(executable, root))
+            self.assertEqual(read.call_args.args[1], 4)
+
+    def test_wda_build_wrong_environment_runs_zero_commands(self):
+        command = mock.Mock()
+        with mock.patch.object(preflight.sys, "platform", "win32"), mock.patch.dict(preflight.os.environ, {"GITHUB_ACTIONS": "true"}):
+            with self.assertRaisesRegex(preflight.AppiumHostPreflightError, "UNSUPPORTED"):
+                preflight.run_appium_wda_build_preflight(command, {"PATH": os.environ["PATH"]})
+        command.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ name: Shortcuts Simulator Inspection
           - synthetic-action-shape
           - appium-host-preflight
           - appium-session-preflight
+          - appium-wda-build-preflight
 
 permissions:
   contents: read

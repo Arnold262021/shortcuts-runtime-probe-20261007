@@ -33,6 +33,7 @@ class ProbeLayoutTests(unittest.TestCase):
         self.assertIn("- synthetic-action-shape", workflow)
         self.assertIn("- appium-host-preflight", workflow)
         self.assertIn("- appium-session-preflight", workflow)
+        self.assertIn("- appium-wda-build-preflight", workflow)
         self.assertIn("SHORTCUTS_PROBE_EXECUTION_MODE: ${{ inputs.probe_mode }}", workflow)
         self.assertIn("timeout-minutes: 15", workflow)
         self.assertIn("cancel-in-progress: false", workflow)

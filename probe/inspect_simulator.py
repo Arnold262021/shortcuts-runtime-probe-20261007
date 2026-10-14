@@ -704,7 +704,8 @@ def main():
         raise RuntimeError("GITHUB_MACOS_RUNNER_REQUIRED")
     mode = os.environ.get("SHORTCUTS_PROBE_EXECUTION_MODE", "open-handles")
     if mode not in {"open-handles", "lsof-preflight", "observed-shortcuts-schema",
-                    "synthetic-action-shape", "appium-host-preflight", "appium-session-preflight"}:
+                    "synthetic-action-shape", "appium-host-preflight", "appium-session-preflight",
+                    "appium-wda-build-preflight"}:
         raise RuntimeError("UNKNOWN_PROBE_EXECUTION_MODE")
     ARTIFACTS.mkdir(exist_ok=False)
     TIMINGS.clear()
@@ -714,6 +715,42 @@ def main():
     receipt = {"scope": "fresh_account_free_simulator", "message_access": False,
                "otp_proven": False, "automation_created": False}
     try:
+        if mode == "appium-wda-build-preflight":
+            from appium_host_preflight import AppiumHostPreflightError, run_appium_wda_build_preflight
+            receipt.update(scope="host_sdk_build_no_explicit_simulator_boot", simulator_boot_requested=False,
+                           webdriver_session_created=False, ui_gestures_run=False,
+                           xcode_test_suite_run=False, store_read=False)
+            try:
+                observed = run_appium_wda_build_preflight(command, SAFE_ENV)
+                receipt["appium_wda_build"] = observed
+            except AppiumHostPreflightError as error:
+                receipt["appium_cleanup_exited"] = error.cleanup_exited
+                receipt["appium_temporary_retained"] = error.temporary_retained
+                if error.primary_code is not None:
+                    receipt["appium_primary_failure"] = error.primary_code
+                build_diagnostic = {}
+                for field in ("build_exit", "build_stdout_bytes", "build_stderr_bytes"):
+                    value = getattr(error, field, None)
+                    if type(value) is int and (field == "build_exit" or value >= 0):
+                        build_diagnostic[field] = value
+                category = getattr(error, "build_failure_category", None)
+                if isinstance(category, str) and category in {"destination_not_supported", "compiler_error", "signing_error", "unknown"}:
+                    build_diagnostic["build_failure_category"] = category
+                for field in ("build_stdout_sha256", "build_stderr_sha256"):
+                    value = getattr(error, field, None)
+                    if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
+                        build_diagnostic[field] = value
+                if build_diagnostic:
+                    receipt["appium_wda_build_failure"] = build_diagnostic
+                raise RuntimeError(error.code) from None
+            if (observed.get("status") != "HOST_WDA_COMPILED_ONLY" or type(observed.get("build_exit")) is not int
+                    or observed.get("build_exit") != 0 or observed.get("runner_bundle_verified") is not True
+                    or observed.get("xctestrun_verified") is not True
+                    or observed.get("simulator_state_unchanged") is not True
+                    or observed.get("cleanup_exited") is not True):
+                raise RuntimeError("HOST_WDA_BUILD_UNCONFIRMED")
+            receipt["status"] = "HOST_WDA_COMPILED_ONLY"
+            return 0
         if mode == "appium-host-preflight":
             from appium_host_preflight import AppiumHostPreflightError, run_appium_host_preflight
             receipt.update(scope="host_appium_setup_only", simulator_started=False, ui_run=False,

@@ -241,6 +241,91 @@ class OpenHandleBoundaryTests(unittest.TestCase):
 
 
 class HostLsofPreflightTests(unittest.TestCase):
+    def test_wda_build_actual_destination_error_reaches_receipt(self):
+        from appium_host_preflight import _build_failure
+        error = _build_failure(probe.subprocess.CompletedProcess(
+            [], 70, b"", b"xcodebuild: error: Unable to find a destination matching the provided destination specifier"))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                patch.object(probe.sys, "platform", "darwin"), \
+                patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                           "SHORTCUTS_PROBE_EXECUTION_MODE": "appium-wda-build-preflight"}), \
+                patch("appium_host_preflight.run_appium_wda_build_preflight", create=True, side_effect=error), \
+                patch("builtins.print"):
+            self.assertEqual(probe.main(), 1)
+            receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+            self.assertEqual(receipt["appium_wda_build_failure"]["build_failure_category"], "destination_not_supported")
+            self.assertEqual(receipt["appium_wda_build_failure"]["build_exit"], 70)
+
+    def test_wda_build_failure_retains_only_typed_allowlist(self):
+        from appium_host_preflight import AppiumHostPreflightError
+        for malformed in (False, True):
+            error = AppiumHostPreflightError("HOST_WDA_BUILD", cleanup_exited=True)
+            error.build_exit = False if malformed else 70
+            error.build_stdout_bytes = -1 if malformed else 123
+            error.build_stderr_bytes = "PRIVATE" if malformed else 456
+            error.build_failure_category = ["PRIVATE"] if malformed else "destination_not_supported"
+            error.build_stdout_sha256 = "PRIVATE" if malformed else "a" * 64
+            error.build_stderr_sha256 = "PRIVATE" if malformed else "b" * 64
+            with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                    patch.object(probe.sys, "platform", "darwin"), \
+                    patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                               "SHORTCUTS_PROBE_EXECUTION_MODE": "appium-wda-build-preflight"}), \
+                    patch("appium_host_preflight.run_appium_wda_build_preflight", create=True, side_effect=error), \
+                    patch("builtins.print"):
+                self.assertEqual(probe.main(), 1)
+                text = (probe.ARTIFACTS / "receipt.json").read_text()
+                self.assertNotIn("PRIVATE", text)
+                receipt = json.loads(text)
+                self.assertEqual(receipt["failure"], "HOST_WDA_BUILD")
+                if malformed:
+                    self.assertNotIn("appium_wda_build_failure", receipt)
+                else:
+                    self.assertEqual(receipt["appium_wda_build_failure"], {
+                        "build_exit": 70, "build_stdout_bytes": 123, "build_stderr_bytes": 456,
+                        "build_failure_category": "destination_not_supported",
+                        "build_stdout_sha256": "a" * 64, "build_stderr_sha256": "b" * 64})
+
+    def test_wda_build_mode_never_requests_session_or_simulator_boot(self):
+        from appium_host_preflight import AppiumHostPreflightError
+        good = {"status": "HOST_WDA_COMPILED_ONLY", "build_exit": 0,
+                "runner_bundle_verified": True, "xctestrun_verified": True,
+                "simulator_state_unchanged": True, "cleanup_exited": True}
+        cases = [(good, None, 0)]
+        for key in ("runner_bundle_verified", "xctestrun_verified", "simulator_state_unchanged", "cleanup_exited"):
+            cases.append((dict(good, **{key: False}), None, 1))
+        cases.append((dict(good, build_exit=False), None, 1))
+        cases.append(({}, AppiumHostPreflightError("HOST_PREFLIGHT_CLEANUP_UNCONFIRMED", cleanup_exited=False,
+                      temporary_retained=True, primary_code="HOST_PREFLIGHT_CALLBACK_UNCONFIRMED"), 1))
+        for observed, error, expected in cases:
+            with self.subTest(observed=observed, error=error), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                    patch.object(probe.sys, "platform", "darwin"), \
+                    patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                               "SHORTCUTS_PROBE_EXECUTION_MODE": "appium-wda-build-preflight"}), \
+                    patch("appium_host_preflight.run_appium_wda_build_preflight", create=True,
+                          return_value=observed, side_effect=error) as build, \
+                    patch.object(probe, "command") as command, \
+                    patch.object(probe, "sim_json") as sim_json, \
+                    patch.object(probe, "native_timeout_probe") as timeout, \
+                    patch.object(probe, "appium_session_preflight") as session, patch("builtins.print"):
+                self.assertEqual(probe.main(), expected)
+                build.assert_called_once_with(command, probe.SAFE_ENV)
+                command.assert_not_called()
+                sim_json.assert_not_called()
+                timeout.assert_not_called()
+                session.assert_not_called()
+                receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+                self.assertFalse(receipt["simulator_boot_requested"])
+                self.assertFalse(receipt["webdriver_session_created"])
+                self.assertFalse(receipt["ui_gestures_run"])
+                self.assertFalse(receipt["xcode_test_suite_run"])
+                self.assertFalse(receipt["store_read"])
+                self.assertFalse(receipt["otp_proven"])
+                if error is not None:
+                    self.assertEqual(receipt["appium_primary_failure"], error.primary_code)
+
     def test_appium_host_preflight_never_starts_simulator_or_ui(self):
         from appium_host_preflight import AppiumHostPreflightError
         for failed in (False, True):
