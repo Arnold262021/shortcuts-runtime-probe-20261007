@@ -658,7 +658,7 @@ def host_lsof_field_preflight():
             "fixture_handle_observed": True}
 
 
-def appium_session_preflight(device_id):
+def appium_session_preflight(device_id, *, prepare_device=None):
     from appium_host_preflight import AppiumHostPreflightError, run_appium_with_owned_server
     from appium_synthetic_ui import run_synthetic_appium_fixture
 
@@ -666,10 +666,19 @@ def appium_session_preflight(device_id):
                 "library_read": False, "condition_payload_proven": False}
 
     def probe(base_url):
+        session_device_id = device_id
+        if prepare_device is not None:
+            observed["host_ready_before_device_preparation"] = True
+            try:
+                session_device_id = prepare_device()
+            except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError):
+                observed["session"] = {"stage": "simulator_preparation", "failure_code": "simulator_preparation_unconfirmed"}
+                return
+            observed["device_preparation_completed"] = True
         if DEADLINE is not None and DEADLINE - time.monotonic() < 240:
             observed["session"] = {"stage": "budget", "failure_code": "session_budget_exhausted"}
             return
-        observed["session"] = run_synthetic_appium_fixture(base_url, device_id, mode="session-only")
+        observed["session"] = run_synthetic_appium_fixture(base_url, session_device_id, mode="session-only")
 
     try:
         observed["host"] = run_appium_with_owned_server(command, SAFE_ENV, probe)
@@ -740,30 +749,37 @@ def main():
             sim_json("list", "runtimes"), sim_json("list", "devices", "available"),
             sim_json("list", "devicetypes"))
         receipt.update(runtime=runtime, device_type=device_type)
-        created = command(["xcrun", "simctl", "create", "Synthetic-Shortcuts-Probe",
-                           device_type, runtime]).stdout
-        device_id = validated_device_id(created)
-        receipt["synthetic_simulator_id"] = device_id
-        if not session_only:
-            collect_xcode_diagnostic(receipt, "destinations_preboot",
-                                     ["xcodebuild", *PROJECT_ARGS, "-showdestinations"], device_id)
-        command(["xcrun", "simctl", "boot", device_id])
-        boot_status = command(["xcrun", "simctl", "bootstatus", device_id, "-b"], timeout=300)
-        receipt["bootstatus_exit"] = boot_status.returncode
         if session_only:
-            receipt.update(scope="fresh_account_free_session_only", simulator_started=True,
+            receipt.update(scope="fresh_account_free_session_only", simulator_started=False,
                            xcode_test_suite_run=False, ui_gestures_run=False, page_source_read=False,
                            store_read=False)
-            observed = appium_session_preflight(device_id)
+
+            def prepare_device():
+                nonlocal device_id
+                created = command(["xcrun", "simctl", "create", "Synthetic-Shortcuts-Probe",
+                                   device_type, runtime]).stdout
+                device_id = validated_device_id(created)
+                receipt["synthetic_simulator_id"] = device_id
+                receipt["simulator_boot_attempted"] = True
+                command(["xcrun", "simctl", "boot", device_id])
+                boot_status = command(["xcrun", "simctl", "bootstatus", device_id, "-b"], timeout=300)
+                receipt["bootstatus_exit"] = boot_status.returncode
+                receipt["simulator_started"] = True
+                return device_id
+
+            observed = appium_session_preflight(None, prepare_device=prepare_device)
             receipt["appium_preflight"] = observed
             receipt["status"] = observed["status"]
-            try:
-                screen = command(["xcrun", "simctl", "io", device_id, "screenshot",
-                                  str(ARTIFACTS / "last-screen.png")], timeout=30, check=False)
-                receipt["last_screenshot_exit"] = screen.returncode
-            except (subprocess.TimeoutExpired, RuntimeError):
-                receipt["last_screenshot_exit"] = "unconfirmed"
-            receipt["cleanup_errors"] = cleanup_device(device_id)
+            if device_id is not None:
+                try:
+                    screen = command(["xcrun", "simctl", "io", device_id, "screenshot",
+                                      str(ARTIFACTS / "last-screen.png")], timeout=30, check=False)
+                    receipt["last_screenshot_exit"] = screen.returncode
+                except (subprocess.TimeoutExpired, RuntimeError):
+                    receipt["last_screenshot_exit"] = "unconfirmed"
+                receipt["cleanup_errors"] = cleanup_device(device_id)
+            else:
+                receipt["cleanup_errors"] = []
             device_id = None
             if receipt["cleanup_errors"]:
                 receipt["status_before_simulator_cleanup"] = observed["status"]
@@ -771,6 +787,15 @@ def main():
             if observed["status"] != "APPIUM_SESSION_READY_ONLY":
                 raise RuntimeError(observed["status"])
             return 0
+        created = command(["xcrun", "simctl", "create", "Synthetic-Shortcuts-Probe",
+                           device_type, runtime]).stdout
+        device_id = validated_device_id(created)
+        receipt["synthetic_simulator_id"] = device_id
+        collect_xcode_diagnostic(receipt, "destinations_preboot",
+                                 ["xcodebuild", *PROJECT_ARGS, "-showdestinations"], device_id)
+        command(["xcrun", "simctl", "boot", device_id])
+        boot_status = command(["xcrun", "simctl", "bootstatus", device_id, "-b"], timeout=300)
+        receipt["bootstatus_exit"] = boot_status.returncode
         bundle = "com.apple.shortcuts"
         receipt["shortcuts_bundle_candidate"] = bundle
         receipt["before_screenshot_exit"] = "not_attempted_after_repeated_pre_ui_timeouts"

@@ -1,4 +1,6 @@
+import io
 import json
+import time
 import unittest
 from unittest.mock import patch
 
@@ -158,8 +160,225 @@ class AppiumSyntheticUiTests(unittest.TestCase):
         self.assertEqual(result["failure_code"], "session_creation_ambiguous")
         self.assertTrue(result["cleanup_unconfirmed"])
 
+    def test_http_error_retains_only_allowed_w3c_category(self):
+        sentinel = "PRIVATE_SENTINEL_DO_NOT_RETAIN"
+
+        class ErrorOpener:
+            def open(self, request, timeout):
+                body = json.dumps({"value": {"error": "session not created", "message": sentinel, "stacktrace": sentinel}}).encode()
+                raise subject.urllib.error.HTTPError(request.full_url, 500, "failure", None, io.BytesIO(body))
+
+        with patch("urllib.request.build_opener", return_value=ErrorOpener()):
+            result = subject.run_synthetic_appium_fixture(self.endpoint, self.uuid)
+        self.assertEqual(result["failure_code"], "session_creation_ambiguous")
+        self.assertEqual(result["webdriver_error_category"], "session not created")
+        self.assertNotIn(sentinel, json.dumps(result))
+
+    def test_http_error_unknown_or_oversized_body_retains_no_category(self):
+        for error_name, oversized in (("not allowlisted", False), ("unknown error", True)):
+            with self.subTest(error_name=error_name, oversized=oversized):
+                class ErrorOpener:
+                    def open(self, request, timeout):
+                        body = json.dumps({"value": {"error": error_name, "message": "PRIVATE_SENTINEL"}}).encode()
+                        if oversized:
+                            body = body + b"x" * (subject._MAX_RESPONSE_BYTES + 1)
+                        raise subject.urllib.error.HTTPError(request.full_url, 500, "failure", None, io.BytesIO(body))
+
+                with patch("urllib.request.build_opener", return_value=ErrorOpener()):
+                    result = subject.run_synthetic_appium_fixture(self.endpoint, self.uuid)
+                self.assertEqual(result["webdriver_error_category"], None)
+                self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
+    def test_http_error_nonstring_categories_are_sanitized_and_closed(self):
+        sentinel = "PRIVATE_SENTINEL_NONSTRING"
+        for category in ({}, [], None, 7):
+            with self.subTest(category=type(category).__name__):
+                class TrackingBody(io.BytesIO):
+                    def __init__(self, payload):
+                        super().__init__(payload)
+                        self.was_closed = False
+
+                    def close(self):
+                        self.was_closed = True
+                        super().close()
+
+                body = TrackingBody(json.dumps({"value": {"error": category, "message": sentinel, "stacktrace": sentinel}}).encode())
+
+                class ErrorOpener:
+                    def open(self, request, timeout):
+                        raise subject.urllib.error.HTTPError(request.full_url, 500, "failure", None, body)
+
+                with patch("urllib.request.build_opener", return_value=ErrorOpener()):
+                    result = subject.run_synthetic_appium_fixture(self.endpoint, self.uuid)
+                self.assertEqual(result["failure_code"], "session_creation_ambiguous")
+                self.assertIsNone(result["webdriver_error_category"])
+                self.assertTrue(body.was_closed)
+                self.assertNotIn(sentinel, json.dumps(result))
+
+    def test_deep_error_or_success_json_cannot_escape_the_sanitized_result(self):
+        deep = b'{"value":' + b"[" * 1500 + b"]" * 1500 + b"}"
+        self.assertLess(len(deep), subject._MAX_RESPONSE_BYTES)
+
+        class TrackingBody(io.BytesIO):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.was_closed = False
+
+            def close(self):
+                self.was_closed = True
+                super().close()
+
+        error_body = TrackingBody(deep)
+
+        class ErrorOpener:
+            def open(self, request, timeout):
+                raise subject.urllib.error.HTTPError(request.full_url, 500, "failure", None, error_body)
+
+        with patch("urllib.request.build_opener", return_value=ErrorOpener()):
+            error_result = subject.run_synthetic_appium_fixture(self.endpoint, self.uuid)
+        self.assertEqual(error_result["failure_code"], "session_creation_ambiguous")
+        self.assertIsNone(error_result["webdriver_error_category"])
+        self.assertTrue(error_body.was_closed)
+
+        class DeepResponse:
+            def __init__(self):
+                self.was_closed = False
+
+            def geturl(self):
+                return "http://127.0.0.1:4723/session"
+
+            def read(self, limit):
+                self.assert_limit = limit
+                return deep
+
+            def close(self):
+                self.was_closed = True
+
+        response = DeepResponse()
+
+        class SuccessOpener:
+            def open(self, request, timeout):
+                return response
+
+        with patch("urllib.request.build_opener", return_value=SuccessOpener()):
+            success_result = subject.run_synthetic_appium_fixture(self.endpoint, self.uuid)
+        self.assertEqual(success_result["failure_code"], "session_creation_ambiguous")
+        self.assertIsNone(success_result["webdriver_error_category"])
+        self.assertTrue(response.was_closed)
+
+    def test_w3c_error_key_is_failure_even_when_value_is_falsy(self):
+        sentinel = "PRIVATE_SENTINEL_FALSY"
+        for category in ({}, [], None, 0, False, ""):
+            with self.subTest(category=type(category).__name__):
+                class Response:
+                    def geturl(self):
+                        return "http://127.0.0.1:4723/session"
+
+                    def read(self, limit):
+                        return json.dumps({"value": {"error": category, "message": sentinel}}).encode()
+
+                    def close(self):
+                        pass
+
+                class Opener:
+                    def open(self, request, timeout):
+                        return Response()
+
+                with patch("urllib.request.build_opener", return_value=Opener()):
+                    result = subject.run_synthetic_appium_fixture(self.endpoint, self.uuid)
+                self.assertEqual(result["failure_code"], "session_creation_ambiguous")
+                self.assertNotIn(sentinel, json.dumps(result))
+
+    def test_falsy_w3c_error_key_stops_wire_for_mutation_and_read(self):
+        sentinel = "PRIVATE_SENTINEL_WIRE"
+
+        class Response:
+            def __init__(self):
+                self.was_closed = False
+
+            def geturl(self):
+                return "http://127.0.0.1:4723/session"
+
+            def read(self, limit):
+                return json.dumps({"value": {"error": {}, "message": sentinel}}).encode()
+
+            def close(self):
+                self.was_closed = True
+
+        class Opener:
+            def __init__(self):
+                self.responses = []
+
+            def open(self, request, timeout):
+                response = Response()
+                self.responses.append(response)
+                return response
+
+        opener = Opener()
+        with patch("urllib.request.build_opener", return_value=opener):
+            wire = subject._Wire(self.endpoint, {"requests": 0, "read_polls": 0}, time.monotonic() + 1)
+            with self.assertRaises(subject._Stop) as mutation:
+                wire.request("POST", "/session", {}, mutation=True, setup=True)
+            wire.begin_commands()
+            with self.assertRaises(subject._Stop) as read:
+                wire.request("GET", "/status")
+        self.assertEqual(mutation.exception.code, "http_ambiguous")
+        self.assertEqual(read.exception.code, "webdriver_read_failed")
+        self.assertTrue(all(response.was_closed for response in opener.responses))
+        self.assertNotIn(sentinel, str(mutation.exception.__dict__))
+        self.assertNotIn(sentinel, str(read.exception.__dict__))
+
+    def test_falsy_w3c_error_on_read_is_not_a_success(self):
+        class Response:
+            def __init__(self, value):
+                self.value = value
+
+            def geturl(self):
+                return "http://127.0.0.1:4723/session"
+
+            def read(self, limit):
+                return json.dumps({"value": self.value}).encode()
+
+            def close(self):
+                pass
+
+        class Opener:
+            def __init__(self):
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                if self.calls == 1:
+                    return Response({"sessionId": "private-session", "capabilities": {"udid": self_uuid, "bundleId": "com.apple.shortcuts", "automationName": "XCUITest", "waitForIdleTimeout": 0}})
+                return Response({"error": {}})
+
+        self_uuid = self.uuid
+        opener = Opener()
+        with patch("urllib.request.build_opener", return_value=opener):
+            result = subject.run_synthetic_appium_fixture(self.endpoint, self.uuid)
+        self.assertEqual(result["failure_code"], "webdriver_read_failed")
+
+    def test_http_error_close_oserror_does_not_escape(self):
+        class BrokenClose(io.BytesIO):
+            def close(self):
+                raise OSError("PRIVATE_SENTINEL_CLOSE")
+
+        body = BrokenClose(json.dumps({"value": {"error": "unknown error"}}).encode())
+
+        class ErrorOpener:
+            def open(self, request, timeout):
+                raise subject.urllib.error.HTTPError(request.full_url, 500, "failure", None, body)
+
+        with patch("urllib.request.build_opener", return_value=ErrorOpener()):
+            result = subject.run_synthetic_appium_fixture(self.endpoint, self.uuid)
+        self.assertEqual(result["failure_code"], "session_creation_ambiguous")
+        self.assertEqual(result["webdriver_error_category"], "unknown error")
+        self.assertNotIn("PRIVATE_SENTINEL_CLOSE", json.dumps(result))
+
     def test_missing_or_multiple_or_not_hittable_are_blocked(self):
         fixture = object.__new__(subject._Fixture)
+        fixture.wire = type("Wire", (), {"command_deadline": time.monotonic()})()
+        fixture.metrics = {"read_polls": 0}
         fixture._wait_candidates = lambda *_args: []
         with self.assertRaises(subject._Stop) as missing:
             fixture._unique(("x",), "gate")
@@ -179,13 +398,13 @@ class AppiumSyntheticUiTests(unittest.TestCase):
             fixture._unique(("x",), "gate")
         self.assertEqual(malformed.exception.code, "invalid_element_state")
 
-    def test_ambiguous_click_is_not_retried_and_session_is_closed(self):
+    def test_foreground_read_failure_closes_session(self):
         wire = _Wire(fail_path="/session/private-session/execute/sync")
         with patch("urllib.request.build_opener", return_value=wire):
             result = subject.run_synthetic_appium_fixture(self.endpoint, self.uuid, mode="fixture")
-        mutations = [call for call in wire.calls if call[1].endswith("/execute/sync")]
-        self.assertEqual(len(mutations), 1)
-        self.assertEqual(result["failure_code"], "http_ambiguous")
+        state_reads = [call for call in wire.calls if call[1].endswith("/execute/sync")]
+        self.assertEqual(len(state_reads), 1)
+        self.assertEqual(result["failure_code"], "http_read_failed")
         self.assertIn(("DELETE", "/session/private-session", None), wire.calls)
 
     def test_ambiguous_element_click_is_not_retried(self):

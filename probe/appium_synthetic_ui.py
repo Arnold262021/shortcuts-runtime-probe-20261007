@@ -21,17 +21,42 @@ _SETUP_SECONDS = 180.0
 _UI_SECONDS = 180.0
 _CLEANUP_SECONDS = 10.0
 _MAX_RESPONSE_BYTES = 64 * 1024
+_W3C_ERROR_CATEGORIES = frozenset({"session not created", "invalid argument", "unknown error", "unknown command", "timeout"})
 
 
 class _Stop(Exception):
-    def __init__(self, stage: str, code: str):
+    def __init__(self, stage: str, code: str, webdriver_error_category: str | None = None):
         self.stage = stage
         self.code = code
+        self.webdriver_error_category = webdriver_error_category if isinstance(webdriver_error_category, str) and webdriver_error_category in _W3C_ERROR_CATEGORIES else None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, msg, headers, newurl):
         return None
+
+
+def _http_error_category(error: urllib.error.HTTPError) -> str | None:
+    try:
+        payload = error.read(_MAX_RESPONSE_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        close = getattr(error, "close", None)
+        if close is not None:
+            try:
+                close()
+            except OSError:
+                pass
+    if len(payload) > _MAX_RESPONSE_BYTES:
+        return None
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    value = decoded.get("value") if isinstance(decoded, dict) else None
+    category = value.get("error") if isinstance(value, dict) else None
+    return category if isinstance(category, str) and category in _W3C_ERROR_CATEGORIES else None
 
 
 class _Wire:
@@ -80,18 +105,20 @@ class _Wire:
                     close()
         except _Stop:
             raise
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+        except urllib.error.HTTPError as error:
+            raise _Stop("wire", "http_ambiguous" if mutation else "http_read_failed", _http_error_category(error)) from None
+        except (urllib.error.URLError, TimeoutError, OSError):
             raise _Stop("wire", "http_ambiguous" if mutation else "http_read_failed") from None
         if len(payload) > _MAX_RESPONSE_BYTES:
             raise _Stop("wire", "wire_response_too_large")
         try:
             decoded = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             raise _Stop("wire", "invalid_wire_response") from None
         if not isinstance(decoded, dict):
             raise _Stop("wire", "invalid_wire_response")
         value = decoded.get("value")
-        if isinstance(value, dict) and value.get("error"):
+        if isinstance(value, dict) and "error" in value:
             raise _Stop("wire", "http_ambiguous" if mutation else "webdriver_read_failed")
         return value
 
@@ -181,13 +208,28 @@ class _Fixture:
         if len(candidates) != 1:
             raise _Stop(stage, "target_not_unique")
         element = candidates[0]
-        if not self._flag(element, "/displayed", stage):
-            raise _Stop(stage, "target_not_visible")
-        if not self._flag(element, "/enabled", stage):
-            raise _Stop(stage, "target_not_enabled")
-        if not self._hittable(element, stage):
-            raise _Stop(stage, "target_not_hittable")
+        self._wait_interactable(element, stage)
         return element
+
+    def _wait_interactable(self, element: str, stage: str) -> None:
+        deadline = min(time.monotonic() + _STAGE_SECONDS, self.wire.command_deadline)
+        last = "target_not_hittable"
+        while True:
+            displayed = self._flag(element, "/displayed", stage)
+            enabled = self._flag(element, "/enabled", stage)
+            hittable = self._hittable(element, stage)
+            if displayed and enabled and hittable:
+                return
+            if not displayed:
+                last = "target_not_visible"
+            elif not enabled:
+                last = "target_not_enabled"
+            else:
+                last = "target_not_hittable"
+            if time.monotonic() >= deadline:
+                raise _Stop(stage, last)
+            self.metrics["read_polls"] += 1
+            time.sleep(0.1)
 
     def _hittable(self, element: str, stage: str) -> bool:
         value = self._attribute(element, "hittable", stage)
@@ -199,7 +241,33 @@ class _Fixture:
 
     def _tap(self, selectors: tuple[str, ...], stage: str, parent: str | None = None) -> None:
         element = self._unique(selectors, stage, parent)
+        self._tap_element(element)
+
+    def _tap_element(self, element: str) -> None:
         self.wire.request("POST", self.root + "/element/" + urllib.parse.quote(element, safe="") + "/click", {}, mutation=True)
+
+    def _descendant_elements(self, parent_selector: str, child_selector: str) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for parent in self._find(parent_selector):
+            for element in self._find(child_selector, parent):
+                if element not in seen:
+                    seen.add(element)
+                    result.append(element)
+        return result
+
+    def _tap_unique_descendant(self, parent_selector: str, child_selector: str, stage: str) -> None:
+        deadline = min(time.monotonic() + _STAGE_SECONDS, self.wire.command_deadline)
+        while True:
+            candidates = self._descendant_elements(parent_selector, child_selector)
+            if candidates or time.monotonic() >= deadline:
+                if len(candidates) != 1:
+                    raise _Stop(stage, "target_not_unique")
+                self._wait_interactable(candidates[0], stage)
+                self._tap_element(candidates[0])
+                return
+            self.metrics["read_polls"] += 1
+            time.sleep(0.1)
 
     def _one(self, selector: str, stage: str, parent: str | None = None) -> str:
         candidates = self._wait_candidates((selector,), stage, parent)
@@ -211,14 +279,28 @@ class _Fixture:
         command = "mobile: activateApp" if active else "mobile: terminateApp"
         self.wire.request("POST", self.root + "/execute/sync", {"script": command, "args": [{"bundleId": _BUNDLE_ID}]}, mutation=True)
 
+    def _wait_app_state(self, expected: int, stage: str, failure_code: str) -> None:
+        deadline = min(time.monotonic() + _STAGE_SECONDS, self.wire.command_deadline)
+        while True:
+            value = self.wire.request(
+                "POST", self.root + "/execute/sync",
+                {"script": "mobile: queryAppState", "args": [{"bundleId": _BUNDLE_ID}]},
+                mutation=False,
+            )
+            if type(value) is not int:
+                raise _Stop(stage, "invalid_app_state")
+            if value == expected:
+                return
+            if time.monotonic() >= deadline:
+                raise _Stop(stage, failure_code)
+            self.metrics["read_polls"] += 1
+            time.sleep(0.1)
+
     def _require_foreground(self) -> None:
-        value = self.wire.request(
-            "POST", self.root + "/execute/sync",
-            {"script": "mobile: queryAppState", "args": [{"bundleId": _BUNDLE_ID}]},
-            mutation=False,
-        )
-        if type(value) is not int or value != 4:
-            raise _Stop("foreground", "app_not_foreground")
+        self._wait_app_state(4, "foreground", "app_not_foreground")
+
+    def _require_not_running(self) -> None:
+        self._wait_app_state(1, "termination", "app_not_terminated")
 
     def _has_named_control(self, label: str) -> bool:
         quoted = json.dumps(label)
@@ -235,7 +317,6 @@ class _Fixture:
 
     def run(self) -> dict[str, bool]:
         outcome = {"fresh_library_empty": False, "filter_ready": False, "nonempty_after_relaunch": False}
-        self._activate(True)
         self._require_foreground()
         onboarding = self._find("type == 'XCUIElementTypeStaticText' AND (label == \"Unified Automations\" OR label == \"What’s New in Shortcuts\")")
         if onboarding:
@@ -247,15 +328,15 @@ class _Fixture:
         outcome["fresh_library_empty"] = True
         self._tap(("type == 'XCUIElementTypeButton' AND name == \"main.button.newshortcut\"",), "new_shortcut")
         if not self._has_named_control("Automation"):
-            editor = self._find("type == 'XCUIElementTypeNavigationBar' AND name == \"New Shortcut\"")
-            if len(editor) > 1:
+            editors = self._descendant_elements(
+                "type == 'XCUIElementTypeNavigationBar' AND name == \"New Shortcut\"",
+                "type == 'XCUIElementTypeButton' AND label == \"Editor\"",
+            )
+            if len(editors) > 1:
                 raise _Stop("switch_to_action_editor", "target_not_unique")
-            if len(editor) == 1:
-                editors = self._find("type == 'XCUIElementTypeButton' AND label == \"Editor\"", editor[0])
-                if len(editors) > 1:
-                    raise _Stop("switch_to_action_editor", "target_not_unique")
-                if len(editors) == 1:
-                    self._tap(("type == 'XCUIElementTypeButton' AND label == \"Editor\"",), "switch_to_action_editor", editor[0])
+            if len(editors) == 1:
+                self._wait_interactable(editors[0], "switch_to_action_editor")
+                self._tap_element(editors[0])
         if not self._has_named_control("Automation"):
             self._named("Edit", "edit_shortcut")
         self._named("Automation", "automation")
@@ -291,11 +372,20 @@ class _Fixture:
         self.wire.request("POST", self.root + "/element/" + urllib.parse.quote(input_element, safe="") + "/value", {"text": _PHRASE}, mutation=True)
         if self._attribute(input_element, "value", "message_contains_value") != _PHRASE:
             raise _Stop("message_contains_value", "filter_value_unconfirmed")
-        self._tap(("type == 'XCUIElementTypeButton' AND name == \"Done\"",), "finish_filter_editing")
+        self._tap_unique_descendant(
+            "type == 'XCUIElementTypeKeyboard'",
+            "type == 'XCUIElementTypeButton' AND name == \"Done\"",
+            "finish_filter_editing",
+        )
         outcome["filter_ready"] = True
-        self._tap(("type == 'XCUIElementTypeButton' AND name == \"BackButton\" AND label == \"Back\"",), "fixture_local_save_back")
+        self._tap_unique_descendant(
+            "type == 'XCUIElementTypeNavigationBar'",
+            "type == 'XCUIElementTypeButton' AND name == \"BackButton\" AND label == \"Back\"",
+            "fixture_local_save_back",
+        )
         self._require_nonempty("fixture_library_after_save")
         self._activate(False)
+        self._require_not_running()
         self._activate(True)
         self._require_foreground()
         self._require_nonempty("fixture_library_after_relaunch")
@@ -363,6 +453,7 @@ def run_synthetic_appium_fixture(base_url: str, own_simulator_id: str, *, mode: 
         "primary_stage": None,
         "primary_failure_code": None,
         "cleanup_unconfirmed": False,
+        "webdriver_error_category": None,
         "metrics": metrics,
     }
     if mode not in ("session-only", "fixture") or not _valid_inputs(base_url, own_simulator_id):
@@ -408,13 +499,14 @@ def run_synthetic_appium_fixture(base_url: str, own_simulator_id: str, *, mode: 
             result["stage"] = "completed"
     except _Stop as failure:
         if session_id is None and session_create_attempted:
-            failure = _Stop("session", "session_creation_ambiguous")
+            failure = _Stop("session", "session_creation_ambiguous", failure.webdriver_error_category)
             result["cleanup_unconfirmed"] = True
         primary_failure = failure
         result["stage"] = failure.stage
         result["failure_code"] = failure.code
         result["primary_stage"] = failure.stage
         result["primary_failure_code"] = failure.code
+        result["webdriver_error_category"] = failure.webdriver_error_category
     finally:
         if session_id is not None:
             try:
