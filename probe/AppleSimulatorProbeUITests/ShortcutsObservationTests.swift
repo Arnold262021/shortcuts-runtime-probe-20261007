@@ -51,7 +51,10 @@ final class ShortcutsObservationTests: XCTestCase {
             stage: "shortcut-share-options"
         ) else { return }
         print("PROBE_SHARE_OPTIONS_OBSERVED=true")
-        print("PROBE_NO_RUN_SAVE_EXPORT_OR_NETWORK_ATTEMPTED=true")
+        guard tapNamedControl("Options", in: shortcuts, stage: "share-format-options") else { return }
+        guard tapNamedControl("File", in: shortcuts, stage: "share-format-file") else { return }
+        print("PROBE_FILE_FORMAT_SELECTED=true")
+        print("PROBE_NO_RUN_OR_NETWORK_CODE=true")
     }
 
     @MainActor
