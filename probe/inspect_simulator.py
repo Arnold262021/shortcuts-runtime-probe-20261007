@@ -864,7 +864,8 @@ def main():
     mode = os.environ.get("SHORTCUTS_PROBE_EXECUTION_MODE", "open-handles")
     if mode not in {"open-handles", "lsof-preflight", "observed-shortcuts-schema",
                     "synthetic-action-shape", "appium-host-preflight", "appium-session-preflight",
-                    "appium-wda-build-preflight", "appium-prebuilt-session-preflight", "wda-launch-preflight"}:
+                    "appium-wda-build-preflight", "appium-prebuilt-session-preflight", "wda-launch-preflight",
+                    "sdk-help-preflight"}:
         raise RuntimeError("UNKNOWN_PROBE_EXECUTION_MODE")
     ARTIFACTS.mkdir(exist_ok=False)
     TIMINGS.clear()
@@ -874,6 +875,20 @@ def main():
     receipt = {"scope": "fresh_account_free_simulator", "message_access": False,
                "otp_proven": False, "automation_created": False}
     try:
+        if mode == "sdk-help-preflight":
+            from sdk_stage_help import run_sdk_stage_help, sdk_help_diagnostic
+            receipt.update(scope="owned_sdk_help_only", simulator_created=False, simulator_booted=False,
+                           wda_invoked=False, host_logs_queried=False, ui_run=False, phone_accessed=False,
+                           webdriver_session_created=False, store_read=False)
+            try:
+                observed = sdk_help_diagnostic(run_sdk_stage_help(SAFE_ENV))
+            except Exception:
+                observed = sdk_help_diagnostic(None)
+            receipt["sdk_help"] = observed
+            if observed["status"] != "SDK_HELP_OBSERVED_ONLY":
+                raise RuntimeError("SDK_HELP_UNCONFIRMED")
+            receipt["status"] = "SDK_HELP_OBSERVED_ONLY"
+            return 0
         if mode == "appium-wda-build-preflight":
             from appium_host_preflight import AppiumHostPreflightError, run_appium_wda_build_preflight
             receipt.update(scope="host_sdk_build_no_explicit_simulator_boot", simulator_boot_requested=False,

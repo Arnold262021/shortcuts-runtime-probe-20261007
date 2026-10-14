@@ -372,6 +372,62 @@ class HostLsofPreflightTests(unittest.TestCase):
                 "runner_candidates": [{"location": "PRIVATE_SENTINEL", "environment_type": "PRIVATE_SENTINEL",
                                         "environment_key_count": True}]}):
             self.assertNotIn("PRIVATE_SENTINEL", json.dumps(probe.wda_template_diagnostic(invalid)))
+    def test_sdk_help_mode_returns_before_every_simulator_or_runtime_probe(self):
+        import sdk_stage_help as sdk
+        stream = {"bytes": 4, "complete": True, "utf8": True, "sha256": "a" * 64,
+                  "literal_counts": dict.fromkeys(sdk.LITERALS, 0)}
+        query = {"status": "observed", "exit_code": 0, "seconds": 0.1, "topic_literal_count": 1,
+                 "timed_out": False, "over_limit": False, "eof_confirmed": True,
+                 "process_started": True, "discard_limit_reached": False, "forced_cleanup": False,
+                 "process_group_drained": True, "stdout": stream, "stderr": stream}
+        clean = {"scope": "owned_sdk_help_only", "status": "SDK_HELP_OBSERVED_ONLY",
+                 "unified_schema_confirmed": False, "cleanup_exited": True,
+                 "temporary_cleanup_confirmed": True,
+                 "queries": dict.fromkeys(sdk.HELP_COMMANDS, query)}
+        for invalid in (False, True):
+            observed = dict(clean, raw_output="PRIVATE_SENTINEL")
+            if invalid:
+                observed["cleanup_exited"] = False
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                    patch.object(probe.sys, "platform", "darwin"), \
+                    patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                               "SHORTCUTS_PROBE_EXECUTION_MODE": "sdk-help-preflight"}), \
+                    patch("sdk_stage_help.run_sdk_stage_help", return_value=observed) as help_probe, \
+                    patch.object(probe, "command") as command, \
+                    patch.object(probe, "native_timeout_probe") as timeout, \
+                    patch.object(probe, "collect_xcode_diagnostic") as xcode, \
+                    patch.object(probe, "sim_json") as sim_json, \
+                    patch.object(probe, "choose_device") as choose, \
+                    patch.object(probe, "cleanup_device") as cleanup, patch("builtins.print"):
+                self.assertEqual(probe.main(), int(invalid))
+                help_probe.assert_called_once_with(probe.SAFE_ENV)
+                for operation in (command, timeout, xcode, sim_json, choose, cleanup):
+                    operation.assert_not_called()
+                saved = (probe.ARTIFACTS / "receipt.json").read_text()
+                self.assertNotIn("PRIVATE_SENTINEL", saved)
+                receipt = json.loads(saved)
+                for key in ("simulator_created", "simulator_booted", "wda_invoked", "host_logs_queried",
+                            "ui_run", "phone_accessed", "webdriver_session_created", "store_read",
+                            "message_access", "otp_proven", "automation_created"):
+                    self.assertIs(receipt[key], False)
+                self.assertEqual(receipt["command_timings"], [])
+                self.assertIs(receipt["sdk_help"]["unified_schema_confirmed"], False)
+
+    def test_sdk_help_unexpected_exception_never_reaches_public_receipt(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                patch.object(probe.sys, "platform", "darwin"), \
+                patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                           "SHORTCUTS_PROBE_EXECUTION_MODE": "sdk-help-preflight"}), \
+                patch("sdk_stage_help.run_sdk_stage_help", side_effect=OSError("PRIVATE_SENTINEL")), \
+                patch.object(probe, "command") as command, patch("builtins.print"):
+            self.assertEqual(probe.main(), 1)
+            command.assert_not_called()
+            saved = (probe.ARTIFACTS / "receipt.json").read_text()
+            self.assertNotIn("PRIVATE_SENTINEL", saved)
+            self.assertEqual(json.loads(saved)["failure"], "SDK_HELP_UNCONFIRMED")
+
     def test_appium_host_preflight_never_starts_simulator_or_ui(self):
         from appium_host_preflight import AppiumHostPreflightError
         for failed in (False, True):
