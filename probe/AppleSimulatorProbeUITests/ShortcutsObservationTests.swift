@@ -59,6 +59,18 @@ final class ShortcutsObservationTests: XCTestCase {
             in: shortcuts,
             stage: "finish-file-options"
         ) else { return }
+        let activities = shortcuts.popovers.collectionViews.matching(identifier: "activityCollectionView")
+        guard activities.element(boundBy: 0).waitForExistence(timeout: stageTimeout), activities.count == 1 else {
+            _ = block(at: "native-file-picker", in: shortcuts, reason: "expected-one-share-activity-list")
+            return
+        }
+        let saveCells = activities.element(boundBy: 0).cells.matching(
+            NSPredicate(format: "identifier == %@ AND label == %@", "actionGroupCell", "Save to Files")
+        )
+        guard tapExactlyOne(
+            buttons: shortcuts.buttons.matching(NSPredicate(value: false)),
+            cells: saveCells, in: shortcuts, stage: "native-file-picker"
+        ) else { return }
         print("PROBE_FILE_EXPORT_UI_ATTEMPTED=true")
         print("PROBE_NO_RUN_OR_NETWORK_CODE=true")
     }

@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 from native_artifact import (
     MAX_SHORTCUT_BYTES,
@@ -61,6 +62,69 @@ class ShortcutArtifactCollectionTests(unittest.TestCase):
         self.assertEqual(1, source_reads)
         self.assertEqual(first_payload, result.artifact_path.read_bytes())
         self.assertEqual(hashlib.sha256(first_payload).hexdigest(), result.receipt.sha256)
+
+    def test_rejects_preexisting_export_when_birthtime_precedes_boundary(self) -> None:
+        temporary, root, artifacts = self.make_root()
+        self.addCleanup(temporary.cleanup)
+        source = root / "old.shortcut"
+        source.write_bytes(b"AEA1old")
+        actual_stat = source.stat()
+        original_stat = Path.stat
+
+        def stat_with_old_birthtime(path: Path, *args: object, **kwargs: object):
+            if path == source:
+                return SimpleNamespace(
+                    st_size=actual_stat.st_size,
+                    st_mode=actual_stat.st_mode,
+                    st_birthtime_ns=1_000,
+                )
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", new=stat_with_old_birthtime):
+            with self.assertRaisesRegex(ShortcutArtifactError, "predates"):
+                collect_shortcut_artifact(root, artifacts, not_before_ns=1_001)
+
+    def test_accepts_recent_export_and_records_birthtime(self) -> None:
+        temporary, root, artifacts = self.make_root()
+        self.addCleanup(temporary.cleanup)
+        source = root / "new.shortcut"
+        source.write_bytes(b"AEA1new")
+        actual_stat = source.stat()
+        original_stat = Path.stat
+
+        def stat_with_recent_birthtime(path: Path, *args: object, **kwargs: object):
+            if path == source:
+                return SimpleNamespace(
+                    st_size=actual_stat.st_size,
+                    st_mode=actual_stat.st_mode,
+                    st_birthtime_ns=2_000,
+                )
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", new=stat_with_recent_birthtime):
+            result = collect_shortcut_artifact(root, artifacts, not_before_ns=2_000)
+
+        self.assertEqual(2_000, result.receipt.birthtime_ns)
+
+    def test_rejects_missing_birthtime_when_boundary_is_required(self) -> None:
+        temporary, root, artifacts = self.make_root()
+        self.addCleanup(temporary.cleanup)
+        source = root / "unknown-birthtime.shortcut"
+        source.write_bytes(b"AEA1unknown")
+        actual_stat = source.stat()
+        original_stat = Path.stat
+
+        def stat_without_birthtime(path: Path, *args: object, **kwargs: object):
+            if path == source:
+                return SimpleNamespace(
+                    st_size=actual_stat.st_size,
+                    st_mode=actual_stat.st_mode,
+                )
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", new=stat_without_birthtime):
+            with self.assertRaisesRegex(ShortcutArtifactError, "no usable birth"):
+                collect_shortcut_artifact(root, artifacts, not_before_ns=1)
 
     def test_rejects_zero_candidates(self) -> None:
         temporary, root, artifacts = self.make_root()

@@ -196,7 +196,35 @@ def cleanup_device(device_id):
     return errors
 
 
-def collect_native_export(device_id):
+def native_artifact_failure_code(stderr):
+    known = {
+        "container root does not exist": "CONTAINER_ROOT_MISSING",
+        "container root must not be a symlink": "CONTAINER_ROOT_SYMLINK",
+        "container root must be a directory": "CONTAINER_ROOT_NOT_DIRECTORY",
+        "no .shortcut file found in container": "NO_NATIVE_FILE",
+        "container has an ambiguous number of .shortcut files": "AMBIGUOUS_NATIVE_FILES",
+        "symlinks are not permitted in container": "CONTAINER_HAS_SYMLINK",
+        "container node limit exceeded": "CONTAINER_NODE_LIMIT",
+        "shortcut export size is outside permitted bounds": "FILE_SIZE_REJECTED",
+        "shortcut export has an unrecognized container magic": "FILE_MAGIC_REJECTED",
+        "cannot inspect container": "CONTAINER_UNREADABLE",
+        "container entry changed during inspection": "CONTAINER_ENTRY_CHANGED",
+        "cannot resolve container entry": "CONTAINER_ENTRY_UNRESOLVED",
+        "container entry escapes supplied root": "CONTAINER_ENTRY_ESCAPE",
+        "cannot stat shortcut export": "FILE_STAT_FAILED",
+        "shortcut export has no usable birth time": "FILE_BIRTHTIME_UNAVAILABLE",
+        "shortcut export predates collection boundary": "FILE_PREDATES_RUN",
+        "cannot read shortcut export": "FILE_UNREADABLE",
+        "cannot write collected shortcut artifact": "ARTIFACT_WRITE_FAILED",
+    }
+    last_line = stderr.decode("utf-8", "replace").strip().splitlines()
+    if not last_line:
+        return "COLLECTOR_FAILED_UNKNOWN"
+    message = last_line[-1].partition("ShortcutArtifactError: ")[2]
+    return known.get(message, "COLLECTOR_FAILED_UNKNOWN")
+
+
+def collect_native_export(device_id, not_before_ns):
     result = command(["xcrun", "simctl", "get_app_container", device_id,
                       "com.apple.shortcuts", "data"], timeout=20)
     try:
@@ -208,11 +236,14 @@ def collect_native_export(device_id):
     if not container.is_relative_to(own_device) or container == own_device:
         raise RuntimeError("EXPORT_CONTAINER_OUTSIDE_OWN_SIMULATOR")
     script = ("import sys; from pathlib import Path; from native_artifact import collect_shortcut_artifact; "
-              "collect_shortcut_artifact(Path(sys.argv[1]), Path(sys.argv[2]))")
-    collected = command([sys.executable, "-c", script, str(container), str(ARTIFACTS)],
+              "collect_shortcut_artifact(Path(sys.argv[1]), Path(sys.argv[2]), "
+              "not_before_ns=int(sys.argv[3]))")
+    collected = command([sys.executable, "-c", script, str(container), str(ARTIFACTS),
+                         str(not_before_ns)],
                         timeout=30, check=False)
     if collected.returncode:
-        raise RuntimeError("NATIVE_SHORTCUT_ARTIFACT_UNCONFIRMED")
+        raise RuntimeError("NATIVE_SHORTCUT_ARTIFACT_UNCONFIRMED:" +
+                           native_artifact_failure_code(collected.stderr))
     return json.loads((ARTIFACTS / "synthetic.shortcut.receipt.json").read_text(encoding="utf-8"))
 
 
@@ -271,6 +302,8 @@ def main():
             "-maximum-test-execution-time-allowance", "180", *diagnostic_options,
             "CODE_SIGNING_ALLOWED=NO"
         ]
+        export_not_before_ns = time.time_ns()
+        receipt["export_not_before_ns"] = export_not_before_ns
         try:
             build = diagnostic_command(build_args, "test-diagnostics.txt", timeout=480,
                                        env=env, simulator_id=device_id)
@@ -303,7 +336,7 @@ def main():
             raise RuntimeError("UI_TEST_FAILED")
         receipt["status"] = "UI_TEST_PASSED_ONLY"
         if "PROBE_FILE_EXPORT_UI_ATTEMPTED=true" in diagnostics:
-            receipt["native_artifact"] = collect_native_export(device_id)
+            receipt["native_artifact"] = collect_native_export(device_id, export_not_before_ns)
             receipt["status"] = "NATIVE_ARTIFACT_COLLECTED_ONLY"
         return 0
     except (RuntimeError, subprocess.TimeoutExpired, ValueError) as error:

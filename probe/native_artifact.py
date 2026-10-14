@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 from typing import Iterator
 
 
@@ -31,6 +32,7 @@ class ShortcutArtifactReceipt:
     bytes: int
     sha256: str
     magic: str
+    birthtime_ns: int | None
 
     def as_dict(self) -> dict[str, int | str]:
         return asdict(self)
@@ -116,8 +118,36 @@ def _detect_magic(prefix: bytes) -> str:
     raise ShortcutArtifactError("shortcut export has an unrecognized container magic")
 
 
-def _read_validated_bytes(source: Path) -> tuple[bytes, ShortcutArtifactReceipt]:
+def _birthtime_ns(source_status: os.stat_result) -> int | None:
+    """Read file birth time without substituting ctime on unsupported platforms."""
+    precise_birthtime = getattr(source_status, "st_birthtime_ns", None)
+    if isinstance(precise_birthtime, int):
+        return precise_birthtime
+
+    # macOS exposes birth time as seconds in stat_result, without a nanosecond
+    # sibling on some supported Python builds.  ctime has different semantics.
+    if sys.platform == "darwin":
+        darwin_birthtime = getattr(source_status, "st_birthtime", None)
+        if isinstance(darwin_birthtime, (int, float)):
+            return int(darwin_birthtime * 1_000_000_000)
+    return None
+
+
+def _read_validated_bytes(
+    source: Path,
+    not_before_ns: int | None,
+) -> tuple[bytes, ShortcutArtifactReceipt]:
     """Read once, bounded at the file contract, before retaining any bytes."""
+    try:
+        birthtime_ns = _birthtime_ns(source.stat())
+    except OSError as error:
+        raise ShortcutArtifactError("cannot stat shortcut export") from error
+    if not_before_ns is not None:
+        if birthtime_ns is None:
+            raise ShortcutArtifactError("shortcut export has no usable birth time")
+        if birthtime_ns < not_before_ns:
+            raise ShortcutArtifactError("shortcut export predates collection boundary")
+
     try:
         with source.open("rb") as export_file:
             payload = export_file.read(MAX_SHORTCUT_BYTES + 1)
@@ -129,6 +159,7 @@ def _read_validated_bytes(source: Path) -> tuple[bytes, ShortcutArtifactReceipt]
         bytes=len(payload),
         sha256=hashlib.sha256(payload).hexdigest(),
         magic=_detect_magic(payload[:4096]),
+        birthtime_ns=birthtime_ns,
     )
 
 
@@ -137,13 +168,20 @@ def collect_shortcut_artifact(
     artifacts_dir: Path,
     *,
     max_nodes: int = MAX_CONTAINER_NODES,
+    not_before_ns: int | None = None,
 ) -> CollectedShortcutArtifact:
     """Copy the sole valid ``.shortcut`` file and write its boundary receipt.
 
     ``container_root`` must already have been resolved by the caller from
-    evidence about the simulator.  This function neither discovers simulator
-    containers nor interprets the shortcut payload.
+    evidence about the simulator.  When ``not_before_ns`` is supplied, a
+    usable file birth time is required and must be no earlier than that
+    boundary. This function neither discovers simulator containers nor
+    interprets the shortcut payload.
     """
+    if not_before_ns is not None and (
+        isinstance(not_before_ns, bool) or not isinstance(not_before_ns, int)
+    ):
+        raise ValueError("not_before_ns must be an integer nanosecond timestamp")
     root = _resolve_regular_root(container_root)
     candidates = [
         path
@@ -161,7 +199,7 @@ def collect_shortcut_artifact(
     temporary_artifact_path = artifacts_dir / f".{SHORTCUT_FILENAME}.tmp"
     temporary_receipt_path = artifacts_dir / f".{RECEIPT_FILENAME}.tmp"
     try:
-        payload, receipt = _read_validated_bytes(candidates[0])
+        payload, receipt = _read_validated_bytes(candidates[0], not_before_ns)
         temporary_artifact_path.write_bytes(payload)
         os.replace(temporary_artifact_path, artifact_path)
         temporary_receipt_path.write_text(
