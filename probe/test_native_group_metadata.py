@@ -23,6 +23,11 @@ class NativeGroupMetadataTests(unittest.TestCase):
         app_groups.mkdir(parents=True)
         return temporary, root, app_groups
 
+    def write_mcm_metadata(self, group: Path, identifier: str) -> None:
+        (group / group_metadata.MCM_METADATA_NAME).write_bytes(
+            plistlib.dumps({"MCMMetadataIdentifier": identifier})
+        )
+
     def test_decodes_json_list_to_canonical_in_memory_paths(self) -> None:
         temporary, own_data, app_groups = self.make_layout()
         self.addCleanup(temporary.cleanup)
@@ -55,6 +60,89 @@ class NativeGroupMetadataTests(unittest.TestCase):
         )
         self.assertEqual([{"identifier": "group.workflow.text", "path": None}], text_result)
 
+    def test_decodes_whitespace_id_path_pairs_only_with_matching_mcm_metadata(self) -> None:
+        temporary, own_data, app_groups = self.make_layout()
+        self.addCleanup(temporary.cleanup)
+        first = app_groups / "first"
+        second = app_groups / "second"
+        first.mkdir()
+        second.mkdir()
+        self.write_mcm_metadata(first, "group.workflow.first")
+        self.write_mcm_metadata(second, "group.workflow.second")
+        raw = (
+            f"group.workflow.first {first.as_posix()}\n"
+            f"group.workflow.second {second.as_posix()}"
+        ).encode()
+
+        result = decode_group_metadata(raw, own_data)
+
+        self.assertEqual(
+            [
+                {"identifier": "group.workflow.first", "path": first.resolve()},
+                {"identifier": "group.workflow.second", "path": second.resolve()},
+            ],
+            result,
+        )
+
+    def test_rejects_id_path_pairs_without_exact_known_metadata_match(self) -> None:
+        temporary, own_data, app_groups = self.make_layout()
+        self.addCleanup(temporary.cleanup)
+        group = app_groups / "pair"
+        group.mkdir()
+        pair = lambda identifier: f"{identifier} {group.as_posix()}".encode()
+
+        with self.assertRaisesRegex(NativeGroupMetadataError, "GROUP_METADATA_FORMAT_UNCONFIRMED"):
+            decode_group_metadata(pair("not-a-group"), own_data)
+        with self.assertRaisesRegex(NativeGroupMetadataError, "GROUP_METADATA_FORMAT_UNCONFIRMED"):
+            decode_group_metadata((pair("group.workflow.pair") + b" extra"), own_data)
+        with self.assertRaisesRegex(NativeGroupMetadataError, "GROUP_METADATA_MCM_MISSING"):
+            decode_group_metadata(pair("group.workflow.pair"), own_data)
+        self.write_mcm_metadata(group, "group.workflow.other")
+        with self.assertRaisesRegex(NativeGroupMetadataError, "GROUP_METADATA_MCM_IDENTIFIER_MISMATCH"):
+            decode_group_metadata(pair("group.workflow.pair"), own_data)
+
+    def test_rejects_oversize_and_symlink_mcm_metadata(self) -> None:
+        temporary, own_data, app_groups = self.make_layout()
+        self.addCleanup(temporary.cleanup)
+        group = app_groups / "pair"
+        group.mkdir()
+        pair = f"group.workflow.pair {group.as_posix()}".encode()
+        metadata = group / group_metadata.MCM_METADATA_NAME
+        metadata.write_bytes(b"x" * (64 * 1024 + 1))
+        with self.assertRaisesRegex(NativeGroupMetadataError, "GROUP_METADATA_MCM_TOO_LARGE"):
+            decode_group_metadata(pair, own_data)
+
+        metadata.unlink()
+        outside = Path(temporary.name) / "outside.plist"
+        self.write_mcm_metadata(group, "group.workflow.pair")
+        target = group / group_metadata.MCM_METADATA_NAME
+        target.replace(outside)
+        try:
+            os.symlink(outside, target)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlink creation unavailable: {error}")
+        with self.assertRaisesRegex(NativeGroupMetadataError, "GROUP_METADATA_MCM_SYMLINK"):
+            decode_group_metadata(pair, own_data)
+
+    def test_rejects_mcm_symlink_before_opening_canonical_metadata_path(self) -> None:
+        temporary, _, _ = self.make_layout()
+        self.addCleanup(temporary.cleanup)
+        group_lexical = Path(temporary.name) / "canonical" / "group"
+        group_lexical.mkdir(parents=True)
+        group = group_lexical.resolve(strict=True)
+        metadata = group / group_metadata.MCM_METADATA_NAME
+        original_lstat = Path.lstat
+
+        def symlink_metadata(path: Path):
+            if path == metadata:
+                return SimpleNamespace(st_mode=stat.S_IFLNK)
+            return original_lstat(path)
+
+        with mock.patch.object(Path, "lstat", new=symlink_metadata), \
+                mock.patch.object(group_metadata.os, "open", side_effect=AssertionError("must not open symlink")):
+            with self.assertRaisesRegex(NativeGroupMetadataError, "GROUP_METADATA_MCM_SYMLINK"):
+                group_metadata._verify_mcm_identifier(group, "group.workflow.pair")
+
     def test_decodes_plist_list_and_line_paths(self) -> None:
         temporary, own_data, app_groups = self.make_layout()
         self.addCleanup(temporary.cleanup)
@@ -64,10 +152,20 @@ class NativeGroupMetadataTests(unittest.TestCase):
         second.mkdir()
 
         plist_result = decode_group_metadata(plistlib.dumps([str(first)]), own_data)
-        line_result = decode_group_metadata((str(first) + "\n" + str(second)).encode(), own_data)
+        line_result = decode_group_metadata((first.as_posix() + "\n" + second.as_posix()).encode(), own_data)
 
         self.assertEqual([{"path": first.resolve()}], plist_result)
         self.assertEqual([{"path": first.resolve()}, {"path": second.resolve()}], line_result)
+
+    def test_preserves_path_only_lines_with_spaces_and_native_separators(self) -> None:
+        temporary, own_data, app_groups = self.make_layout()
+        self.addCleanup(temporary.cleanup)
+        group = app_groups / "group with spaces"
+        group.mkdir()
+
+        result = decode_group_metadata(str(group).encode(), own_data)
+
+        self.assertEqual([{"path": group.resolve()}], result)
 
     def test_canonicalizes_lexical_own_data_alias(self) -> None:
         temporary, own_data, app_groups = self.make_layout()
