@@ -661,6 +661,89 @@ def _simulator_states(raw: object) -> dict[str, str]:
         raise AppiumHostPreflightError("HOST_WDA_SIMCTL") from None
 
 
+def _owned_wda_template_shape(derived: Path, root: Path) -> dict[str, object]:
+    """Read only fixed-field shape and hashes, never template values or paths."""
+    def kind(value):
+        return {dict: "dict", list: "list", str: "str", int: "int", bool: "bool",
+                bytes: "bytes", float: "float", type(None): "none"}.get(type(value), "other")
+
+    def environment_shape(target, location):
+        variables = target.get("EnvironmentVariables")
+        dictionary = isinstance(variables, dict)
+        return {"location": location, "environment_present": "EnvironmentVariables" in target,
+                "environment_type": kind(variables),
+                "environment_key_count": len(variables) if dictionary else 0,
+                "use_ip_present": dictionary and "USE_IP" in variables,
+                "use_port_present": dictionary and "USE_PORT" in variables,
+                "environment_dictionary_without_bindings": dictionary and "USE_IP" not in variables and "USE_PORT" not in variables}
+
+    products = derived / "Build" / "Products"
+    try:
+        runs = [path for path in products.iterdir() if path.suffix == ".xctestrun"]
+        if len(runs) != 1:
+            raise ValueError("run count")
+        raw = _read_owned_bounded(runs[0], root, "HOST_WDA_OUTPUT")
+        body = plistlib.loads(raw)
+        if not isinstance(body, dict):
+            raise ValueError("run type")
+        info_raw = _read_owned_bounded(products / "Debug-iphonesimulator" /
+            "WebDriverAgentRunner-Runner.app" / "Info.plist", root, "HOST_WDA_OUTPUT")
+        info = plistlib.loads(info_raw)
+        if not isinstance(info, dict):
+            raise ValueError("info type")
+        metadata = body.get("__xctestrun_metadata__")
+        version = metadata.get("FormatVersion") if isinstance(metadata, dict) else None
+        legacy = body.get("WebDriverAgentRunner")
+        configurations = body.get("TestConfigurations")
+        if "TestConfigurations" in body and not isinstance(configurations, list):
+            raise ValueError("config type")
+        candidates = []
+        if isinstance(legacy, dict):
+            candidates.append(environment_shape(legacy, "legacy_target"))
+        configuration_count = len(configurations) if isinstance(configurations, list) else 0
+        if configuration_count > 16:
+            raise ValueError("config count")
+        targets_count = 0
+        if isinstance(configurations, list):
+            for configuration in configurations:
+                if not isinstance(configuration, dict):
+                    raise ValueError("configuration type")
+                targets = configuration.get("TestTargets")
+                if "TestTargets" in configuration and not isinstance(targets, list):
+                    raise ValueError("targets type")
+                if not isinstance(targets, list):
+                    continue
+                targets_count += len(targets)
+                if targets_count > 32:
+                    raise ValueError("target count")
+                for target in targets:
+                    if isinstance(target, dict) and target.get("BlueprintName") == "WebDriverAgentRunner":
+                        candidates.append(environment_shape(target, "configuration_target"))
+        bundle = info.get("CFBundleIdentifier")
+        executable = info.get("CFBundleExecutable")
+        bundle_valid = isinstance(bundle, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9.-]{1,254}", bundle) is not None
+        executable_valid = (isinstance(executable, str) and bool(executable) and executable.isascii()
+                            and Path(executable).name == executable and executable not in {".", ".."})
+        metadata_accepted = ("__xctestrun_metadata__" not in body or
+                             (isinstance(metadata, dict) and type(version) is int and version == 1))
+        return {"scope": "owned_build_template_only", "template_sha256": hashlib.sha256(raw).hexdigest(),
+                "template_bytes": len(raw), "info_sha256": hashlib.sha256(info_raw).hexdigest(),
+                "metadata_present": "__xctestrun_metadata__" in body, "metadata_type": kind(metadata),
+                "format_version_type": kind(version),
+                "format_version_class": ("v1" if type(version) is int and version == 1 else
+                                         "v2" if type(version) is int and version == 2 else
+                                         "missing" if version is None else "other"),
+                "legacy_runner_type": kind(legacy), "configurations_present": "TestConfigurations" in body,
+                "configurations_type": kind(configurations), "configurations_count": configuration_count,
+                "test_targets_count": targets_count, "runner_candidates_count": len(candidates),
+                "runner_candidates": candidates,
+                "legacy_launch_format_accepted": isinstance(legacy, dict) and "TestConfigurations" not in body and metadata_accepted,
+                "runner_bundle_identifier_valid": bundle_valid, "runner_executable_valid": executable_valid,
+                "runner_info_accepted": bundle_valid and executable_valid}
+    except (OSError, ValueError, TypeError, KeyError, RecursionError, plistlib.InvalidFileException):
+        raise AppiumHostPreflightError("HOST_WDA_OUTPUT") from None
+
+
 def _remove_owned_root(root: Path, identity: tuple[int, int]) -> None:
     status = root.lstat()
     if root.is_symlink() or (status.st_dev, status.st_ino) != identity or not root.name.startswith("appium-host-preflight-"):
@@ -713,11 +796,13 @@ def _build_owned_wda(command: Callable[..., object], appium: Path, env: dict[str
     if before_states != after_states:
         raise AppiumHostPreflightError("HOST_WDA_SIMULATOR_STATE_CHANGED")
     _validated_wda_outputs(derived, root)
+    template_shape = _owned_wda_template_shape(derived, root)
     return {
         "xcuitest_version": xcuitest_version, "wda_package_version": package_version,
         "wda_package_sha256": package_sha256, "build_exit": 0,
         "runner_bundle_verified": True, "xctestrun_verified": True,
         "simulator_state_unchanged": True, "simulator_device_count": len(after_states),
+        "xctestrun_template_shape": template_shape,
         "private_paths": {"derived_data_path": str(derived), "package_root_path": str(package_root)},
     }
 
@@ -947,6 +1032,7 @@ def run_appium_wda_build_preflight(command: Callable[..., object], safe_env: dic
             "wda_package_version": wda_result["wda_package_version"],
             "wda_package_sha256": wda_result["wda_package_sha256"],
             "xcuitest_version": wda_result["xcuitest_version"], "cleanup_exited": True,
+            "xctestrun_template_shape": wda_result["xctestrun_template_shape"],
             "duration_ms": int((time.monotonic() - started) * 1000),
         }
     except AppiumHostPreflightError as error:

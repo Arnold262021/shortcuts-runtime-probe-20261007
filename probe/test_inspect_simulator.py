@@ -291,11 +291,36 @@ class HostLsofPreflightTests(unittest.TestCase):
         from appium_host_preflight import AppiumHostPreflightError
         good = {"status": "HOST_WDA_COMPILED_ONLY", "build_exit": 0,
                 "runner_bundle_verified": True, "xctestrun_verified": True,
-                "simulator_state_unchanged": True, "cleanup_exited": True}
+                "simulator_state_unchanged": True, "cleanup_exited": True,
+                "xctestrun_template_shape": {"scope": "owned_build_template_only",
+                    "template_sha256": "a" * 64, "info_sha256": "b" * 64, "template_bytes": 10,
+                    "metadata_present": True, "metadata_type": "dict", "format_version_type": "int",
+                    "format_version_class": "v2", "legacy_runner_type": "none", "configurations_present": True,
+                    "configurations_type": "list", "configurations_count": 1, "test_targets_count": 1,
+                    "runner_candidates_count": 1, "runner_candidates": [{"location": "configuration_target",
+                        "environment_present": False, "environment_type": "none", "environment_key_count": 0,
+                        "use_ip_present": False, "use_port_present": False,
+                        "environment_dictionary_without_bindings": False}],
+                    "legacy_launch_format_accepted": False, "runner_bundle_identifier_valid": True,
+                    "runner_executable_valid": True, "runner_info_accepted": True}}
         cases = [(good, None, 0)]
         for key in ("runner_bundle_verified", "xctestrun_verified", "simulator_state_unchanged", "cleanup_exited"):
             cases.append((dict(good, **{key: False}), None, 1))
         cases.append((dict(good, build_exit=False), None, 1))
+        for shape in ({}, {"scope": "owned_build_template_only", "template_sha256": "a" * 64,
+                           "info_sha256": "b" * 64, "template_bytes": True},
+                      dict(good["xctestrun_template_shape"], template_bytes=0)):
+            cases.append((dict(good, xctestrun_template_shape=shape), None, 1))
+        shape = good["xctestrun_template_shape"]
+        for key in shape:
+            missing = dict(shape)
+            missing.pop(key)
+            cases.append((dict(good, xctestrun_template_shape=missing), None, 1))
+        cases.append((dict(good, xctestrun_template_shape=dict(shape, runner_candidates_count=2)), None, 1))
+        for key in shape["runner_candidates"][0]:
+            candidate = dict(shape["runner_candidates"][0])
+            candidate.pop(key)
+            cases.append((dict(good, xctestrun_template_shape=dict(shape, runner_candidates=[candidate])), None, 1))
         cases.append(({}, AppiumHostPreflightError("HOST_PREFLIGHT_CLEANUP_UNCONFIRMED", cleanup_exited=False,
                       temporary_retained=True, primary_code="HOST_PREFLIGHT_CALLBACK_UNCONFIRMED"), 1))
         for observed, error, expected in cases:
@@ -326,6 +351,27 @@ class HostLsofPreflightTests(unittest.TestCase):
                 if error is not None:
                     self.assertEqual(receipt["appium_primary_failure"], error.primary_code)
 
+    def test_template_shape_allowlist_retains_structure_not_private_values(self):
+        raw = {"scope": "owned_build_template_only", "template_sha256": "a" * 64,
+               "info_sha256": "b" * 64, "template_bytes": 123, "metadata_present": True,
+               "format_version_type": "int", "format_version_class": "v2",
+               "legacy_launch_format_accepted": False, "path": "PRIVATE_SENTINEL",
+               "unknown_raw": {"PRIVATE_SENTINEL": "PRIVATE_SENTINEL"}, "runner_candidates": [
+                   {"location": "configuration_target", "environment_type": "dict",
+                    "environment_present": True, "environment_key_count": 2, "use_ip_present": False,
+                    "use_port_present": False, "environment_dictionary_without_bindings": True,
+                    "EnvironmentVariables": {"SENTINEL": "PRIVATE_SENTINEL"}}]}
+        result = probe.wda_template_diagnostic(raw)
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+        self.assertEqual(result["format_version_class"], "v2")
+        self.assertFalse(result["legacy_launch_format_accepted"])
+        self.assertNotIn("EnvironmentVariables", result["runner_candidates"][0])
+        for invalid in (None, "PRIVATE_SENTINEL", [], {"scope": "PRIVATE_SENTINEL",
+                "template_sha256": "PRIVATE_SENTINEL", "template_bytes": True,
+                "format_version_type": ["PRIVATE_SENTINEL"], "format_version_class": "PRIVATE_SENTINEL",
+                "runner_candidates": [{"location": "PRIVATE_SENTINEL", "environment_type": "PRIVATE_SENTINEL",
+                                        "environment_key_count": True}]}):
+            self.assertNotIn("PRIVATE_SENTINEL", json.dumps(probe.wda_template_diagnostic(invalid)))
     def test_appium_host_preflight_never_starts_simulator_or_ui(self):
         from appium_host_preflight import AppiumHostPreflightError
         for failed in (False, True):

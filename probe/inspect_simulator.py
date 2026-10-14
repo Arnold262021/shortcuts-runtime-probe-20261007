@@ -674,6 +674,51 @@ def wda_failure_diagnostic(error):
     return observed
 
 
+def wda_template_diagnostic(value):
+    if not isinstance(value, dict):
+        return {}
+    observed = {}
+    if value.get("scope") == "owned_build_template_only":
+        observed["scope"] = "owned_build_template_only"
+    for key in ("template_sha256", "info_sha256"):
+        item = value.get(key)
+        if isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item):
+            observed[key] = item
+    for key in ("template_bytes", "configurations_count", "test_targets_count", "runner_candidates_count"):
+        item = value.get(key)
+        if type(item) is int and 0 <= item <= 65536:
+            observed[key] = item
+    for key in ("metadata_present", "configurations_present", "legacy_launch_format_accepted",
+                "runner_bundle_identifier_valid", "runner_executable_valid", "runner_info_accepted"):
+        if type(value.get(key)) is bool:
+            observed[key] = value[key]
+    for key in ("metadata_type", "format_version_type", "legacy_runner_type", "configurations_type"):
+        if value.get(key) in ("dict", "list", "str", "int", "bool", "bytes", "float", "none", "other"):
+            observed[key] = value[key]
+    if value.get("format_version_class") in ("v1", "v2", "missing", "other"):
+        observed["format_version_class"] = value["format_version_class"]
+    candidates = value.get("runner_candidates")
+    if isinstance(candidates, list) and len(candidates) <= 33:
+        safe_candidates = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            item = {}
+            if candidate.get("location") in ("legacy_target", "configuration_target"):
+                item["location"] = candidate["location"]
+            if candidate.get("environment_type") in ("dict", "list", "str", "int", "bool", "bytes", "float", "none", "other"):
+                item["environment_type"] = candidate["environment_type"]
+            for key in ("environment_present", "use_ip_present", "use_port_present", "environment_dictionary_without_bindings"):
+                if type(candidate.get(key)) is bool:
+                    item[key] = candidate[key]
+            count = candidate.get("environment_key_count")
+            if type(count) is int and 0 <= count <= 65536:
+                item["environment_key_count"] = count
+            safe_candidates.append(item)
+        observed["runner_candidates"] = safe_candidates
+    return observed
+
+
 def wda_launch_diagnostic(value):
     if not isinstance(value, dict):
         return {}
@@ -705,6 +750,9 @@ def wda_launch_diagnostic(value):
                 safe_build[key] = build[key]
         if isinstance(build.get("wda_package_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", build["wda_package_sha256"]):
             safe_build["wda_package_sha256"] = build["wda_package_sha256"]
+        shape = wda_template_diagnostic(build.get("xctestrun_template_shape"))
+        if shape:
+            safe_build["xctestrun_template_shape"] = shape
         observed["wda_build"] = safe_build
     return observed
 
@@ -800,6 +848,8 @@ def main():
                            xcode_test_suite_run=False, store_read=False)
             try:
                 observed = run_appium_wda_build_preflight(command, SAFE_ENV)
+                observed = dict(observed) if isinstance(observed, dict) else {}
+                observed["xctestrun_template_shape"] = wda_template_diagnostic(observed.get("xctestrun_template_shape"))
                 receipt["appium_wda_build"] = observed
             except AppiumHostPreflightError as error:
                 receipt["appium_cleanup_exited"] = error.cleanup_exited
@@ -810,7 +860,22 @@ def main():
                 if build_diagnostic:
                     receipt["appium_wda_build_failure"] = build_diagnostic
                 raise RuntimeError(error.code) from None
-            if (observed.get("status") != "HOST_WDA_COMPILED_ONLY" or type(observed.get("build_exit")) is not int
+            shape = observed["xctestrun_template_shape"]
+            required_shape = {"scope", "template_sha256", "info_sha256", "template_bytes",
+                "metadata_present", "metadata_type", "format_version_type", "format_version_class",
+                "legacy_runner_type", "configurations_present", "configurations_type", "configurations_count",
+                "test_targets_count", "runner_candidates_count", "runner_candidates", "legacy_launch_format_accepted",
+                "runner_bundle_identifier_valid", "runner_executable_valid", "runner_info_accepted"}
+            required_candidate = {"location", "environment_present", "environment_type", "environment_key_count",
+                "use_ip_present", "use_port_present", "environment_dictionary_without_bindings"}
+            if (shape.get("scope") != "owned_build_template_only"
+                    or not required_shape.issubset(shape)
+                    or shape.get("runner_candidates_count") != len(shape.get("runner_candidates", []))
+                    or not shape.get("runner_candidates")
+                    or any(not required_candidate.issubset(candidate) for candidate in shape.get("runner_candidates", []))
+                    or "template_sha256" not in shape or "info_sha256" not in shape
+                    or type(shape.get("template_bytes")) is not int or not 0 < shape["template_bytes"] <= 65536
+                    or observed.get("status") != "HOST_WDA_COMPILED_ONLY" or type(observed.get("build_exit")) is not int
                     or observed.get("build_exit") != 0 or observed.get("runner_bundle_verified") is not True
                     or observed.get("xctestrun_verified") is not True
                     or observed.get("simulator_state_unchanged") is not True

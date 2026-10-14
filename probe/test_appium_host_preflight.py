@@ -354,6 +354,69 @@ class WdaLaunchPreflightTests(unittest.TestCase):
                 mock.patch.object(preflight.time, "sleep"):
             self.assertFalse(preflight._wda_endpoint_closed(8100))
 
+    def test_owned_wda_template_shape_reports_only_sanitized_fixed_shape(self):
+        with tempfile.TemporaryDirectory(prefix="appium-host-preflight-") as directory:
+            root = Path(directory)
+            products = root / "derived" / "Build" / "Products"
+            runner = products / "Debug-iphonesimulator" / "WebDriverAgentRunner-Runner.app"
+            runner.mkdir(parents=True)
+            (runner / "Info.plist").write_bytes(plistlib.dumps({
+                "CFBundleIdentifier": "com.example.WDARunner",
+                "CFBundleExecutable": "Runner",
+                "PRIVATE_SENTINEL": "/private/hidden",
+            }))
+            run = products / "Runner.xctestrun"
+            cases = (
+                ({"WebDriverAgentRunner": {"EnvironmentVariables": {"SECRET": "PRIVATE_SENTINEL"}},
+                  "__xctestrun_metadata__": {"FormatVersion": 1}}, "v1", "int", True),
+                ({"WebDriverAgentRunner": {"EnvironmentVariables": False},
+                  "__xctestrun_metadata__": {"FormatVersion": True}}, "other", "bool", False),
+                ({"WebDriverAgentRunner": {"EnvironmentVariables": {"A": "x", "B": "y"}},
+                  "__xctestrun_metadata__": {"FormatVersion": 2}}, "v2", "int", False),
+            )
+            for body, version, version_type, accepted in cases:
+                with self.subTest(version=version):
+                    run.write_bytes(plistlib.dumps(body))
+                    shape = preflight._owned_wda_template_shape(root / "derived", root)
+                    self.assertEqual(shape["format_version_class"], version)
+                    self.assertEqual(shape["format_version_type"], version_type)
+                    self.assertEqual(shape["legacy_launch_format_accepted"], accepted)
+                    self.assertNotIn("PRIVATE_SENTINEL", json.dumps(shape))
+                    self.assertNotIn("/private/hidden", json.dumps(shape))
+            run.write_bytes(plistlib.dumps({"WebDriverAgentRunner": {"EnvironmentVariables": {
+                "USE_IP": "127.0.0.1", "USE_PORT": "8100"}}}))
+            shape = preflight._owned_wda_template_shape(root / "derived", root)
+            candidate = shape["runner_candidates"][0]
+            self.assertFalse(candidate["environment_dictionary_without_bindings"])
+            self.assertTrue(candidate["use_ip_present"])
+            self.assertTrue(candidate["use_port_present"])
+            v2 = {"__xctestrun_metadata__": {"FormatVersion": 2}, "TestConfigurations": [{
+                "TestTargets": [{"BlueprintName": "WebDriverAgentRunner"}]
+            }]}
+            run.write_bytes(plistlib.dumps(v2))
+            before = run.read_bytes()
+            shape = preflight._owned_wda_template_shape(root / "derived", root)
+            self.assertEqual(shape["format_version_class"], "v2")
+            self.assertEqual(shape["runner_candidates"][0]["environment_type"], "none")
+            self.assertFalse(shape["runner_candidates"][0]["environment_present"])
+            self.assertFalse(shape["runner_candidates"][0]["environment_dictionary_without_bindings"])
+            self.assertEqual(hashlib.sha256(before).hexdigest(), shape["template_sha256"])
+            self.assertEqual(run.read_bytes(), before)
+            for malformed in ({"TestConfigurations": 3}, {"TestConfigurations": [{}] * 17},
+                              {"TestConfigurations": [{"TestTargets": [{}] * 33}]},):
+                with self.subTest(malformed=malformed):
+                    run.write_bytes(plistlib.dumps(malformed))
+                    with self.assertRaisesRegex(preflight.AppiumHostPreflightError, "HOST_WDA_OUTPUT"):
+                        preflight._owned_wda_template_shape(root / "derived", root)
+            (runner / "Info.plist").write_bytes(plistlib.dumps({
+                "CFBundleIdentifier": "bad identifier", "CFBundleExecutable": ".."
+            }))
+            run.write_bytes(plistlib.dumps({"WebDriverAgentRunner": {}}))
+            shape = preflight._owned_wda_template_shape(root / "derived", root)
+            self.assertFalse(shape["runner_bundle_identifier_valid"])
+            self.assertFalse(shape["runner_executable_valid"])
+            self.assertFalse(shape["runner_info_accepted"])
+
     def _exercise_wda(self, *, changed=False, bad_output=False, bad_install=False,
                       private_version=False, escape=False, build_failure=None, wrong_bundle=False,
                       prebuilt=False):
@@ -452,6 +515,12 @@ class WdaLaunchPreflightTests(unittest.TestCase):
             self.assertTrue(result[key])
         self.assertEqual(result["wda_package_version"], "16.15.0")
         self.assertRegex(result["wda_package_sha256"], r"^[0-9a-f]{64}$")
+        shape = result["xctestrun_template_shape"]
+        self.assertEqual(shape["scope"], "owned_build_template_only")
+        self.assertRegex(shape["template_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(shape["info_sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotIn("PRIVATE", json.dumps(shape))
+        self.assertNotIn("private_paths", json.dumps(shape))
         popen.assert_not_called()
         commands = [args for args, _ in seen]
         self.assertEqual(sum(args[:2] == ["xcrun", "simctl"] for args in commands), 2)
