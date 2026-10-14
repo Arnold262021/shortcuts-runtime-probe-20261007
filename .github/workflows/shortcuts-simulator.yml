@@ -14,6 +14,7 @@ name: Shortcuts Simulator Inspection
           - observed-shortcuts-schema
           - synthetic-action-shape
           - appium-host-preflight
+          - appium-session-preflight
 
 permissions:
   contents: read

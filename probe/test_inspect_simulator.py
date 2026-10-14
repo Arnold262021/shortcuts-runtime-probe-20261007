@@ -816,6 +816,112 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(probe.choose_device(self.runtimes, self.devices, self.types),
                          ("com.apple.CoreSimulator.SimRuntime.iOS-27-0", "test.iphone"))
 
+    def test_appium_session_mode_never_uses_native_ui_or_store_reader(self):
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+        for status, failure_action, cleanup_failure, expected in (
+                ("APPIUM_SESSION_READY_ONLY", None, None, 0),
+                ("APPIUM_SESSION_UNCONFIRMED", None, None, 1),
+                ("APPIUM_SESSION_READY_ONLY", "shutdown", "timeout", 1),
+                ("APPIUM_SESSION_READY_ONLY", "shutdown", "nonzero", 1),
+                ("APPIUM_SESSION_READY_ONLY", "delete", "nonzero", 1),
+                ("APPIUM_SESSION_UNCONFIRMED", "delete", "nonzero", 1)):
+            seen = []
+
+            def fake_command(args, **kwargs):
+                seen.append(args)
+                if failure_action is not None and args[1:3] == ["simctl", failure_action]:
+                    if cleanup_failure == "timeout":
+                        raise probe.subprocess.TimeoutExpired("owned-cleanup", 30)
+                    return probe.subprocess.CompletedProcess(args, 1, b"", b"")
+                stdout = identifier.encode() if args[1:3] == ["simctl", "create"] else b""
+                return probe.subprocess.CompletedProcess(args, 0, stdout, b"")
+
+            with self.subTest(status=status, action=failure_action, failure=cleanup_failure), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                    patch.object(probe.sys, "platform", "darwin"), \
+                    patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                               "SHORTCUTS_PROBE_EXECUTION_MODE": "appium-session-preflight"}), \
+                    patch.object(probe, "sim_json", side_effect=[self.runtimes, self.devices, self.types]), \
+                    patch.object(probe, "command", side_effect=fake_command), \
+                    patch.object(probe, "appium_session_preflight", return_value={"status": status}) as session, \
+                    patch.object(probe, "native_timeout_probe") as timeout_probe, patch("builtins.print"):
+                self.open_probe.reset_mock()
+                self.assertEqual(probe.main(), expected)
+                session.assert_called_once_with(identifier)
+                self.open_probe.assert_not_called()
+                timeout_probe.assert_not_called()
+                self.schema_probe.assert_not_called()
+                self.assertTrue(all(args[0] != "xcodebuild" for args in seen))
+                self.assertEqual(seen.count(["xcrun", "simctl", "shutdown", identifier]), 1)
+                self.assertEqual(seen.count(["xcrun", "simctl", "delete", identifier]), 1)
+                receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+                self.assertEqual(receipt["scope"], "fresh_account_free_session_only")
+                self.assertFalse(receipt["ui_gestures_run"])
+                self.assertFalse(receipt["xcode_test_suite_run"])
+                self.assertFalse(receipt["page_source_read"])
+                self.assertFalse(receipt["store_read"])
+                self.assertFalse(receipt["message_access"])
+                self.assertFalse(receipt["otp_proven"])
+                if failure_action is not None:
+                    self.assertEqual(receipt["failure"], "SIMULATOR_CLEANUP_UNCONFIRMED")
+                    self.assertEqual(receipt["status_before_simulator_cleanup"], status)
+                    self.assertEqual(receipt["appium_preflight"]["status"], status)
+                    self.assertTrue(receipt["cleanup_errors"])
+
+    def test_session_preflight_requires_effective_gates_and_independent_cleanup(self):
+        clean = {"stage": "session_only_completed", "session_initialized": True, "idle0": True,
+                 "cleanup_unconfirmed": False, "failure_code": None}
+
+        def owned(command, env, callback):
+            callback("http://127.0.0.1:1234")
+            return {"cleanup_exited": True}
+
+        for changes, expected in (({}, "APPIUM_SESSION_READY_ONLY"),
+                                  ({"stage": "completed"}, "APPIUM_SESSION_UNCONFIRMED"),
+                                  ({"session_initialized": False}, "APPIUM_SESSION_UNCONFIRMED"),
+                                  ({"idle0": False}, "APPIUM_SESSION_UNCONFIRMED"),
+                                  ({"cleanup_unconfirmed": True}, "APPIUM_SESSION_UNCONFIRMED"),
+                                  ({"failure_code": "session_creation_ambiguous"}, "APPIUM_SESSION_UNCONFIRMED")):
+            with self.subTest(changes=changes), \
+                    patch("appium_host_preflight.run_appium_with_owned_server", side_effect=owned), \
+                    patch("appium_synthetic_ui.run_synthetic_appium_fixture", return_value=dict(clean, **changes)) as client, \
+                    patch.object(probe, "DEADLINE", None):
+                result = probe.appium_session_preflight("owned")
+                self.assertEqual(result["status"], expected)
+                client.assert_called_once_with("http://127.0.0.1:1234", "owned", mode="session-only")
+                self.assertFalse(result["library_read"])
+                self.assertFalse(result["ui_gestures_run"])
+
+    def test_session_preflight_retains_session_when_host_cleanup_fails(self):
+        from appium_host_preflight import AppiumHostPreflightError
+
+        def owned(command, env, callback):
+            callback("http://127.0.0.1:1234")
+            raise AppiumHostPreflightError("HOST_PREFLIGHT_CLEANUP_UNCONFIRMED", cleanup_exited=False,
+                                          temporary_retained=True, primary_code="HOST_PREFLIGHT_CALLBACK_UNCONFIRMED")
+
+        with patch("appium_host_preflight.run_appium_with_owned_server", side_effect=owned), \
+                patch("appium_synthetic_ui.run_synthetic_appium_fixture", return_value={"failure_code": "session_creation_ambiguous"}), \
+                patch.object(probe, "DEADLINE", None):
+            result = probe.appium_session_preflight("owned")
+        self.assertEqual(result["session"]["failure_code"], "session_creation_ambiguous")
+        self.assertFalse(result["cleanup_exited"])
+        self.assertTrue(result["temporary_retained"])
+        self.assertEqual(result["status"], "HOST_PREFLIGHT_CLEANUP_UNCONFIRMED")
+
+    def test_session_preflight_will_not_post_when_global_budget_insufficient(self):
+        def owned(command, env, callback):
+            callback("http://127.0.0.1:1234")
+            return {"cleanup_exited": True}
+
+        with patch("appium_host_preflight.run_appium_with_owned_server", side_effect=owned), \
+                patch("appium_synthetic_ui.run_synthetic_appium_fixture") as client, \
+                patch.object(probe, "DEADLINE", 300), patch.object(probe.time, "monotonic", return_value=100):
+            result = probe.appium_session_preflight("owned")
+        client.assert_not_called()
+        self.assertEqual(result["session"]["failure_code"], "session_budget_exhausted")
+        self.assertEqual(result["status"], "APPIUM_SESSION_UNCONFIRMED")
+
     def test_unavailable_runtime_rejected(self):
         self.runtimes["runtimes"][0]["isAvailable"] = False
         with self.assertRaisesRegex(RuntimeError, "TEMPLATE_ABSENT"):

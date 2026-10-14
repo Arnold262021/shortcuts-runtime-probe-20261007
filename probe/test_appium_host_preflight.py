@@ -34,7 +34,7 @@ class AppiumHostPreflightTests(unittest.TestCase):
         with mock.patch.object(preflight.os, "killpg", create=True):
             self.assertFalse(preflight._cleanup(process))
 
-    def exercise(self, status=None, cleanup=True, driver_version="12.18.1", process_exited=False):
+    def exercise(self, status=None, cleanup=True, driver_version="12.18.1", process_exited=False, probe=None):
         seen = []
 
         def command(args, **kwargs):
@@ -75,9 +75,13 @@ class AppiumHostPreflightTests(unittest.TestCase):
                     mock.patch.object(preflight, "_cleanup", return_value=cleanup) as stop, \
                     mock.patch.object(preflight.time, "sleep"):
                 try:
-                    result = preflight.run_appium_host_preflight(command, {
+                    env = {
                         "PATH": os.environ["PATH"], "npm_config_userconfig": "/private/SENTINEL",
-                        "npm_config_registry": "https://sentinel.invalid/"})
+                        "npm_config_registry": "https://sentinel.invalid/"}
+                    if probe is None:
+                        result = preflight.run_appium_host_preflight(command, env)
+                    else:
+                        result = preflight.run_appium_with_owned_server(command, env, probe)
                 except preflight.AppiumHostPreflightError as error:
                     result = error
             root = Path(seen[0][1]["env"]["APPIUM_HOME"]).parent
@@ -116,6 +120,42 @@ class AppiumHostPreflightTests(unittest.TestCase):
                 self.assertEqual(read.call_count, 30)
                 stop.assert_called_once()
                 self.assertNotIn("SENTINEL", str(error))
+
+    def test_probe_runs_only_after_readiness_and_before_teardown(self):
+        observed = []
+
+        def probe(url):
+            self.assertRegex(url, r"^http://127\.0\.0\.1:\d+$")
+            observed.append(url)
+
+        result, _, _, read, stop = self.exercise(probe=probe)
+        self.assertEqual(len(observed), 1)
+        self.assertTrue(result["cleanup_exited"])
+        read.assert_called_once()
+        stop.assert_called_once()
+
+    def test_unready_host_never_calls_probe(self):
+        probe = mock.Mock()
+        error, _, _, _, stop = self.exercise(status={"value": []}, probe=probe)
+        self.assertEqual(error.code, "HOST_PREFLIGHT_STATUS_UNCONFIRMED")
+        probe.assert_not_called()
+        stop.assert_called_once()
+
+    def test_probe_exception_is_sanitized_and_owned_server_stops(self):
+        probe = mock.Mock(side_effect=RuntimeError("PRIVATE_SENTINEL"))
+        error, _, _, _, stop = self.exercise(probe=probe)
+        self.assertEqual(error.code, "HOST_PREFLIGHT_CALLBACK_UNCONFIRMED")
+        self.assertTrue(error.cleanup_exited)
+        self.assertNotIn("SENTINEL", str(error))
+        probe.assert_called_once()
+        stop.assert_called_once()
+
+    def test_probe_failure_and_cleanup_failure_preserve_primary(self):
+        error, _, _, _, stop = self.exercise(probe=mock.Mock(side_effect=ValueError("PRIVATE_SENTINEL")), cleanup=False)
+        self.assertEqual(error.code, "HOST_PREFLIGHT_CLEANUP_UNCONFIRMED")
+        self.assertEqual(error.primary_code, "HOST_PREFLIGHT_CALLBACK_UNCONFIRMED")
+        self.assertTrue(error.temporary_retained)
+        stop.assert_called_once()
 
     def test_wrong_driver_never_starts_server(self):
         error, _, popen, read, stop = self.exercise(driver_version="12.18.0")

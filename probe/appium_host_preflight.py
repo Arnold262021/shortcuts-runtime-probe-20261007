@@ -1,4 +1,4 @@
-"""Ephemeral, host-only Appium preflight; it never creates a WebDriver session."""
+"""Ephemeral owned Appium server; the host-only entry point has no session API."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ _ERRORS = frozenset({
     "HOST_PREFLIGHT_DRIVER_INSTALL", "HOST_PREFLIGHT_SERVER_START", "HOST_PREFLIGHT_STATUS_UNCONFIRMED",
     "HOST_PREFLIGHT_CLEANUP_UNCONFIRMED",
     "HOST_PREFLIGHT_NODE_COMMAND", "HOST_PREFLIGHT_NPM_COMMAND", "HOST_PREFLIGHT_DRIVER_VERSION",
+    "HOST_PREFLIGHT_CALLBACK_UNCONFIRMED",
 })
 
 
@@ -144,6 +145,23 @@ def run_appium_host_preflight(command: Callable[..., object], safe_env: dict[str
     `command` must be the caller's bounded command wrapper. This API has no
     UDID, capability, session, simulator, or UI input.
     """
+    return _run_owned_server(command, safe_env)
+
+
+def run_appium_with_owned_server(command: Callable[..., object], safe_env: dict[str, str],
+                                probe: Callable[[str], None]) -> dict[str, object]:
+    """Call a trusted probe after readiness and always tear down owned resources.
+
+    The probe receives only the loopback URL. It must bound its own requests and
+    retain a sanitized result in its caller, including any ambiguous session.
+    """
+    if not callable(probe):
+        raise AppiumHostPreflightError("HOST_PREFLIGHT_CALLBACK_UNCONFIRMED")
+    return _run_owned_server(command, safe_env, probe)
+
+
+def _run_owned_server(command: Callable[..., object], safe_env: dict[str, str],
+                      on_ready: Callable[[str], None] | None = None) -> dict[str, object]:
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise AppiumHostPreflightError("HOST_PREFLIGHT_UNSUPPORTED_ENVIRONMENT")
     env = {key: value for key, value in safe_env.items() if not key.upper().startswith("NPM_CONFIG_")}
@@ -227,6 +245,11 @@ def run_appium_host_preflight(command: Callable[..., object], safe_env: dict[str
                     raise AppiumHostPreflightError("HOST_PREFLIGHT_STATUS_UNCONFIRMED")
             except AppiumHostPreflightError:
                 raise
+            if on_ready is not None:
+                try:
+                    on_ready(f"http://127.0.0.1:{port}")
+                except Exception:
+                    raise AppiumHostPreflightError("HOST_PREFLIGHT_CALLBACK_UNCONFIRMED") from None
     except AppiumHostPreflightError as error:
         primary = error
     except OSError:

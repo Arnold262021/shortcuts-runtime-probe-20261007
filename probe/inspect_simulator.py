@@ -658,13 +658,44 @@ def host_lsof_field_preflight():
             "fixture_handle_observed": True}
 
 
+def appium_session_preflight(device_id):
+    from appium_host_preflight import AppiumHostPreflightError, run_appium_with_owned_server
+    from appium_synthetic_ui import run_synthetic_appium_fixture
+
+    observed = {"scope": "owned_simulator_session_only", "ui_gestures_run": False,
+                "library_read": False, "condition_payload_proven": False}
+
+    def probe(base_url):
+        if DEADLINE is not None and DEADLINE - time.monotonic() < 240:
+            observed["session"] = {"stage": "budget", "failure_code": "session_budget_exhausted"}
+            return
+        observed["session"] = run_synthetic_appium_fixture(base_url, device_id, mode="session-only")
+
+    try:
+        observed["host"] = run_appium_with_owned_server(command, SAFE_ENV, probe)
+    except AppiumHostPreflightError as error:
+        observed.update(status=error.code, cleanup_exited=error.cleanup_exited,
+                        temporary_retained=error.temporary_retained)
+        if error.primary_code is not None:
+            observed["primary_failure"] = error.primary_code
+        return observed
+    session = observed.get("session", {})
+    if (not isinstance(session, dict) or session.get("failure_code") is not None or session.get("stage") != "session_only_completed"
+            or session.get("session_initialized") is not True or session.get("idle0") is not True
+            or session.get("cleanup_unconfirmed") is not False):
+        observed["status"] = "APPIUM_SESSION_UNCONFIRMED"
+    else:
+        observed["status"] = "APPIUM_SESSION_READY_ONLY"
+    return observed
+
+
 def main():
     global DEADLINE
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise RuntimeError("GITHUB_MACOS_RUNNER_REQUIRED")
     mode = os.environ.get("SHORTCUTS_PROBE_EXECUTION_MODE", "open-handles")
     if mode not in {"open-handles", "lsof-preflight", "observed-shortcuts-schema",
-                    "synthetic-action-shape", "appium-host-preflight"}:
+                    "synthetic-action-shape", "appium-host-preflight", "appium-session-preflight"}:
         raise RuntimeError("UNKNOWN_PROBE_EXECUTION_MODE")
     ARTIFACTS.mkdir(exist_ok=False)
     TIMINGS.clear()
@@ -693,16 +724,18 @@ def main():
                            ui_run=False, shortcuts_association_proven=False)
             receipt.update(host_lsof_field_preflight())
             return 0
-        receipt["native_timeout_probe"] = native_timeout_probe()
-        print("PROBE_NATIVE_TIMEOUT=" + json.dumps(receipt["native_timeout_probe"]), flush=True)
-        if not receipt["native_timeout_probe"]["wrapper_return_bounded_with_descendant_present"]:
-            raise RuntimeError("NATIVE_TIMEOUT_PROBE_UNCONFIRMED")
-        collect_xcode_diagnostic(receipt, "sdks", ["xcodebuild", "-showsdks"])
-        help_result = collect_xcode_diagnostic(receipt, "xcode_help", ["xcodebuild", "-help"])
-        help_text = ((help_result.stdout + help_result.stderr).decode("utf-8", "replace")
-                     if help_result is not None else "")
-        diagnostic_options = test_diagnostic_options(help_text)
-        receipt["system_diagnostics_policy"] = "never" if diagnostic_options else "default"
+        session_only = mode == "appium-session-preflight"
+        if not session_only:
+            receipt["native_timeout_probe"] = native_timeout_probe()
+            print("PROBE_NATIVE_TIMEOUT=" + json.dumps(receipt["native_timeout_probe"]), flush=True)
+            if not receipt["native_timeout_probe"]["wrapper_return_bounded_with_descendant_present"]:
+                raise RuntimeError("NATIVE_TIMEOUT_PROBE_UNCONFIRMED")
+            collect_xcode_diagnostic(receipt, "sdks", ["xcodebuild", "-showsdks"])
+            help_result = collect_xcode_diagnostic(receipt, "xcode_help", ["xcodebuild", "-help"])
+            help_text = ((help_result.stdout + help_result.stderr).decode("utf-8", "replace")
+                         if help_result is not None else "")
+            diagnostic_options = test_diagnostic_options(help_text)
+            receipt["system_diagnostics_policy"] = "never" if diagnostic_options else "default"
         runtime, device_type = choose_device(
             sim_json("list", "runtimes"), sim_json("list", "devices", "available"),
             sim_json("list", "devicetypes"))
@@ -711,11 +744,33 @@ def main():
                            device_type, runtime]).stdout
         device_id = validated_device_id(created)
         receipt["synthetic_simulator_id"] = device_id
-        collect_xcode_diagnostic(receipt, "destinations_preboot",
-                                 ["xcodebuild", *PROJECT_ARGS, "-showdestinations"], device_id)
+        if not session_only:
+            collect_xcode_diagnostic(receipt, "destinations_preboot",
+                                     ["xcodebuild", *PROJECT_ARGS, "-showdestinations"], device_id)
         command(["xcrun", "simctl", "boot", device_id])
         boot_status = command(["xcrun", "simctl", "bootstatus", device_id, "-b"], timeout=300)
         receipt["bootstatus_exit"] = boot_status.returncode
+        if session_only:
+            receipt.update(scope="fresh_account_free_session_only", simulator_started=True,
+                           xcode_test_suite_run=False, ui_gestures_run=False, page_source_read=False,
+                           store_read=False)
+            observed = appium_session_preflight(device_id)
+            receipt["appium_preflight"] = observed
+            receipt["status"] = observed["status"]
+            try:
+                screen = command(["xcrun", "simctl", "io", device_id, "screenshot",
+                                  str(ARTIFACTS / "last-screen.png")], timeout=30, check=False)
+                receipt["last_screenshot_exit"] = screen.returncode
+            except (subprocess.TimeoutExpired, RuntimeError):
+                receipt["last_screenshot_exit"] = "unconfirmed"
+            receipt["cleanup_errors"] = cleanup_device(device_id)
+            device_id = None
+            if receipt["cleanup_errors"]:
+                receipt["status_before_simulator_cleanup"] = observed["status"]
+                raise RuntimeError("SIMULATOR_CLEANUP_UNCONFIRMED")
+            if observed["status"] != "APPIUM_SESSION_READY_ONLY":
+                raise RuntimeError(observed["status"])
+            return 0
         bundle = "com.apple.shortcuts"
         receipt["shortcuts_bundle_candidate"] = bundle
         receipt["before_screenshot_exit"] = "not_attempted_after_repeated_pre_ui_timeouts"
