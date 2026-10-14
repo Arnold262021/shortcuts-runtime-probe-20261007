@@ -582,7 +582,7 @@ def main():
             "-derivedDataPath", str(ROOT.parent / "DerivedData"),
             "-resultBundlePath", str(result_path), "-parallel-testing-enabled", "NO",
             "-maximum-concurrent-test-simulator-destinations", "1",
-            "-test-timeouts-enabled", "YES", "-default-test-execution-time-allowance", "120",
+            "-test-timeouts-enabled", "YES", "-default-test-execution-time-allowance", "180",
             "-maximum-test-execution-time-allowance", "180", *diagnostic_options,
             "CODE_SIGNING_ALLOWED=NO"
         ]

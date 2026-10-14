@@ -463,11 +463,11 @@ class SelectionTests(unittest.TestCase):
         self.addCleanup(schema_probe.stop)
         groups_probe = patch.object(probe, "collect_shortcuts_group_metadata", return_value={
             "status": "GROUP_PATH_METADATA_ONLY", "groups": {}, "group_store_read": False})
-        groups_probe.start()
+        self.groups_probe = groups_probe.start()
         self.addCleanup(groups_probe.stop)
         entitlements_probe = patch.object(probe, "collect_native_entitlement_metadata", return_value={
             "status": "SYSTEM_GROUP_ENTITLEMENT_NOT_DECLARED", "system_store_read": False})
-        entitlements_probe.start()
+        self.entitlements_probe = entitlements_probe.start()
         self.addCleanup(entitlements_probe.stop)
         self.runtimes = {"runtimes": [{"isAvailable": True, "version": "27.0",
                          "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-27-0"}]}
@@ -615,7 +615,36 @@ class SelectionTests(unittest.TestCase):
             build_call = next(call for call in command.call_args_list
                               if call.args[0][:2] == ["xcodebuild", "test"])
             self.assertEqual(build_call.kwargs["env"]["TEST_RUNNER_SHORTCUTS_PROBE_MODE"], "schema-only")
+            self.assertEqual(build_args[build_args.index("-default-test-execution-time-allowance") + 1], "180")
+            self.assertEqual(build_args[build_args.index("-maximum-test-execution-time-allowance") + 1], "180")
+            self.assertEqual(build_call.kwargs["timeout"], 480)
             self.assertIsNone(probe.DEADLINE)
+
+    def test_nonzero_ui_exit_blocks_stores_even_with_all_witness_markers(self):
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+
+        def fake_command(args, **kwargs):
+            stdout = identifier.encode() if args[1:3] == ["simctl", "create"] else b""
+            if args[:2] == ["xcodebuild", "test"]:
+                return probe.subprocess.CompletedProcess(args, 65,
+                    b"PROBE_SYNTHETIC_FILTER_READY=true\nPROBE_SYNTHETIC_LIBRARY_NONEMPTY_AFTER_RELAUNCH=true\n", b"")
+            return probe.subprocess.CompletedProcess(args, 0, stdout, b"")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ROOT", Path(directory) / "probe"), \
+                patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                patch.object(probe.sys, "platform", "darwin"), \
+                patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch.object(probe, "sim_json", side_effect=[self.runtimes, self.devices, self.types]), \
+                patch.object(probe, "command", side_effect=fake_command), patch("builtins.print"):
+            self.assertEqual(probe.main(), 1)
+            self.schema_probe.assert_not_called()
+            self.entitlements_probe.assert_not_called()
+            self.groups_probe.assert_not_called()
+            receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+            self.assertEqual(receipt["failure"], "UI_TEST_FAILED")
+            self.assertNotIn("native_entitlement_metadata", receipt)
+            self.assertFalse(receipt["otp_proven"])
 
     def test_command_timeout_obeys_remaining_budget(self):
         with patch.object(probe, "DEADLINE", 102), \
