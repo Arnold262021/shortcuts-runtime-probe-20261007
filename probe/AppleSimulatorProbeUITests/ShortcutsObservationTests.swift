@@ -32,6 +32,19 @@ final class ShortcutsObservationTests: XCTestCase {
         guard configureMessageContains(in: shortcuts) else { return }
 
         print("PROBE_MESSAGE_FILTER_VALUE_OBSERVED=\(syntheticPhrase)")
+        guard tapUnique(
+            shortcuts.keyboards.buttons.matching(identifier: "Done"),
+            in: shortcuts,
+            stage: "finish-filter-editing"
+        ) else { return }
+        guard tapUnique(
+            shortcuts.navigationBars.buttons.matching(
+                NSPredicate(format: "label ENDSWITH %@", ", Actions Menu")
+            ),
+            in: shortcuts,
+            stage: "shortcut-actions-menu"
+        ) else { return }
+        print("PROBE_ACTIONS_MENU_OBSERVED=true")
         print("PROBE_NO_RUN_SAVE_EXPORT_OR_NETWORK_ATTEMPTED=true")
     }
 
