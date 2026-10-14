@@ -31,6 +31,7 @@ class ProbeLayoutTests(unittest.TestCase):
         self.assertIn("- lsof-preflight", workflow)
         self.assertIn("- observed-shortcuts-schema", workflow)
         self.assertIn("- synthetic-action-shape", workflow)
+        self.assertIn("- appium-host-preflight", workflow)
         self.assertIn("SHORTCUTS_PROBE_EXECUTION_MODE: ${{ inputs.probe_mode }}", workflow)
         self.assertIn("timeout-minutes: 15", workflow)
         self.assertIn("cancel-in-progress: false", workflow)

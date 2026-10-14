@@ -241,6 +241,37 @@ class OpenHandleBoundaryTests(unittest.TestCase):
 
 
 class HostLsofPreflightTests(unittest.TestCase):
+    def test_appium_host_preflight_never_starts_simulator_or_ui(self):
+        from appium_host_preflight import AppiumHostPreflightError
+        for failed in (False, True):
+            error = AppiumHostPreflightError("HOST_PREFLIGHT_CLEANUP_UNCONFIRMED", cleanup_exited=False,
+                                            temporary_retained=True,
+                                            primary_code="HOST_PREFLIGHT_STATUS_UNCONFIRMED")
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                    patch.object(probe.sys, "platform", "darwin"), \
+                    patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                               "SHORTCUTS_PROBE_EXECUTION_MODE": "appium-host-preflight"}), \
+                    patch("appium_host_preflight.run_appium_host_preflight",
+                          return_value={"status_ready": True}, side_effect=error if failed else None) as host, \
+                    patch.object(probe, "command") as command, \
+                    patch.object(probe, "native_timeout_probe") as timeout, \
+                    patch.object(probe, "sim_json") as sim_json, patch("builtins.print"):
+                self.assertEqual(probe.main(), int(failed))
+                command.assert_not_called()
+                sim_json.assert_not_called()
+                timeout.assert_not_called()
+                host.assert_called_once_with(command, probe.SAFE_ENV)
+                receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+                self.assertFalse(receipt["simulator_started"])
+                self.assertFalse(receipt["ui_run"])
+                self.assertFalse(receipt["webdriver_session_created"])
+                self.assertFalse(receipt["otp_proven"])
+                if failed:
+                    self.assertFalse(receipt["appium_cleanup_exited"])
+                    self.assertTrue(receipt["appium_temporary_retained"])
+                    self.assertEqual(receipt["appium_primary_failure"], "HOST_PREFLIGHT_STATUS_UNCONFIRMED")
+
     def test_host_mode_never_starts_simulator_or_ui(self):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
@@ -1027,6 +1058,14 @@ class SelectionTests(unittest.TestCase):
                 patch("builtins.print"):
             probe.command(["synthetic", "diagnostic"], timeout=60)
             self.assertEqual(run.call_args.kwargs["timeout"], 2)
+
+    def test_command_label_never_retains_temporary_executable_path(self):
+        with patch.object(probe, "DEADLINE", None), \
+                patch.object(probe, "run_with_timeout", return_value=
+                             probe.subprocess.CompletedProcess([], 0)), patch("builtins.print") as output:
+            probe.command(["/private/SENTINEL/appium", "driver", "--help"], check=False)
+        self.assertEqual(probe.TIMINGS[-1]["command"], "appium driver --help")
+        self.assertNotIn("SENTINEL", str(output.call_args_list))
 
     def test_bounded_process_uses_files_and_its_own_session(self):
         process = MagicMock(pid=4321, returncode=0)

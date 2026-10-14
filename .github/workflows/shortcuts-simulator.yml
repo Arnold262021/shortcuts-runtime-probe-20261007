@@ -13,6 +13,7 @@ name: Shortcuts Simulator Inspection
           - lsof-preflight
           - observed-shortcuts-schema
           - synthetic-action-shape
+          - appium-host-preflight
 
 permissions:
   contents: read

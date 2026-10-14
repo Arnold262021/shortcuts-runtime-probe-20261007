@@ -94,7 +94,8 @@ def command(args, timeout=60, check=True, env=None, honor_budget=True):
         if remaining <= 0:
             raise RuntimeError("PROBE_BUDGET_EXHAUSTED")
         timeout = min(timeout, remaining)
-    stage = " ".join(args[:3])
+    stage = " ".join(Path(arg).name if Path(arg).is_absolute() or arg.startswith("/") else arg
+                     for arg in args[:3])
     print(f"PROBE_COMMAND_START={stage}", flush=True)
     try:
         result = run_with_timeout(args, timeout=timeout, env=env or SAFE_ENV)
@@ -662,7 +663,8 @@ def main():
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise RuntimeError("GITHUB_MACOS_RUNNER_REQUIRED")
     mode = os.environ.get("SHORTCUTS_PROBE_EXECUTION_MODE", "open-handles")
-    if mode not in {"open-handles", "lsof-preflight", "observed-shortcuts-schema", "synthetic-action-shape"}:
+    if mode not in {"open-handles", "lsof-preflight", "observed-shortcuts-schema",
+                    "synthetic-action-shape", "appium-host-preflight"}:
         raise RuntimeError("UNKNOWN_PROBE_EXECUTION_MODE")
     ARTIFACTS.mkdir(exist_ok=False)
     TIMINGS.clear()
@@ -672,6 +674,20 @@ def main():
     receipt = {"scope": "fresh_account_free_simulator", "message_access": False,
                "otp_proven": False, "automation_created": False}
     try:
+        if mode == "appium-host-preflight":
+            from appium_host_preflight import AppiumHostPreflightError, run_appium_host_preflight
+            receipt.update(scope="host_appium_setup_only", simulator_started=False, ui_run=False,
+                           webdriver_session_created=False)
+            try:
+                receipt["appium_host"] = run_appium_host_preflight(command, SAFE_ENV)
+            except AppiumHostPreflightError as error:
+                receipt["appium_cleanup_exited"] = error.cleanup_exited
+                receipt["appium_temporary_retained"] = error.temporary_retained
+                if error.primary_code is not None:
+                    receipt["appium_primary_failure"] = error.primary_code
+                raise RuntimeError(error.code) from None
+            receipt["status"] = "HOST_APPIUM_READY_ONLY"
+            return 0
         if mode == "lsof-preflight":
             receipt.update(scope="host_cli_field_shape_only", simulator_started=False,
                            ui_run=False, shortcuts_association_proven=False)
