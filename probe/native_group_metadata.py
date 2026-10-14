@@ -157,27 +157,20 @@ def _safe_group_path(path_text: str, app_group_root: Path) -> Path:
     if not candidate.is_absolute():
         raise NativeGroupMetadataError("GROUP_METADATA_PATH_UNCONFIRMED")
 
-    # Normalize lexical aliases before looking for symlinks. This avoids a
-    # mocked/home alias affecting the containment comparison while keeping any
-    # symlink component visible to lstat below.
+    # Resolve only the declared parent. It may be the Darwin /var alias for a
+    # canonical /private/var AppGroup root, but the leaf must remain a direct
+    # child and is inspected through the canonical root below.
     lexical = Path(os.path.abspath(os.path.normpath(str(candidate))))
     try:
-        relative = lexical.relative_to(app_group_root)
-    except ValueError as error:
-        raise NativeGroupMetadataError("GROUP_METADATA_PATH_ESCAPE") from error
-    if not relative.parts:
-        raise NativeGroupMetadataError("GROUP_METADATA_PATH_UNCONFIRMED")
-
-    current = app_group_root
-    try:
-        for segment in relative.parts:
-            current = current / segment
-            status = current.lstat()
-            if stat.S_ISLNK(status.st_mode):
-                raise NativeGroupMetadataError("GROUP_METADATA_PATH_SYMLINK")
+        if lexical.parent.resolve(strict=True) != app_group_root:
+            raise NativeGroupMetadataError("GROUP_METADATA_PATH_ESCAPE")
+        canonical_candidate = app_group_root / lexical.name
+        status = canonical_candidate.lstat()
+        if stat.S_ISLNK(status.st_mode):
+            raise NativeGroupMetadataError("GROUP_METADATA_PATH_SYMLINK")
         if not stat.S_ISDIR(status.st_mode):
             raise NativeGroupMetadataError("GROUP_METADATA_PATH_UNCONFIRMED")
-        resolved = lexical.resolve(strict=True)
+        resolved = canonical_candidate.resolve(strict=True)
     except NativeGroupMetadataError:
         raise
     except FileNotFoundError as error:
