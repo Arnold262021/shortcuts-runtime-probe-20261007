@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 import shutil
 import sys
@@ -9,6 +10,11 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).parent
+GENERIC_STEP_CONDITION = (
+    "inputs.probe_mode != 'sdk-posix-fixture-preflight' && "
+    "inputs.probe_mode != 'sdk-installed-help-docs-only' && "
+    "inputs.probe_mode != 'sdk-help-preflight'"
+)
 
 
 def workflow_source(root):
@@ -22,16 +28,65 @@ class ProbeLayoutTests(unittest.TestCase):
         body = workflow.split(f"- name: {name}", 1)[1]
         return body.split(f"- name: {next_name}", 1)[0]
 
+    def _assert_step_condition(self, body, condition):
+        conditions = [line.strip() for line in body.splitlines()
+                      if line.strip().startswith("if:")]
+        self.assertEqual(conditions, [f"if: {condition}"])
+
+    def _step_selected(self, body, mode):
+        conditions = [line.strip()[4:] for line in body.splitlines()
+                      if line.strip().startswith("if:")]
+        self.assertEqual(len(conditions), 1)
+        expression = conditions[0].replace("inputs.probe_mode", "mode").replace("&&", "and")
+        tree = ast.parse(expression, mode="eval")
+        allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Compare, ast.Eq,
+                   ast.NotEq, ast.Name, ast.Load, ast.Constant)
+        self.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)))
+        self.assertTrue(all(node.id == "mode" for node in ast.walk(tree)
+                            if isinstance(node, ast.Name)))
+        return eval(compile(tree, "<workflow-condition>", "eval"),
+                    {"__builtins__": {}}, {"mode": mode})
+
     def _assert_focal_step_conditions(self, workflow):
         broad = self._workflow_step(
             workflow, "Test generic probe contracts", "Test focal synthetic POSIX contracts")
         focal = self._workflow_step(
-            workflow, "Test focal synthetic POSIX contracts", "Inspect selected generic lab mode")
+            workflow, "Test focal synthetic POSIX contracts", "Inspect installed SDK help only")
         inspect = self._workflow_step(
             workflow, "Inspect selected generic lab mode", "Preserve synthetic UI evidence")
-        self.assertIn("if: inputs.probe_mode != 'sdk-posix-fixture-preflight'", broad)
-        self.assertIn("if: inputs.probe_mode == 'sdk-posix-fixture-preflight'", focal)
-        self.assertIn("if: inputs.probe_mode != 'sdk-posix-fixture-preflight'", inspect)
+        self._assert_step_condition(broad, GENERIC_STEP_CONDITION)
+        self._assert_step_condition(focal, "inputs.probe_mode == 'sdk-posix-fixture-preflight'")
+        self._assert_step_condition(inspect, GENERIC_STEP_CONDITION)
+
+    def _assert_sdk_help_isolation(self, workflow):
+        options = workflow.split("options:", 1)[1].split("\npermissions:", 1)[0]
+        choices = [line.strip()[2:] for line in options.splitlines()
+                   if line.strip().startswith("- ")]
+        self.assertIn("sdk-installed-help-docs-only", choices)
+        self.assertNotIn("sdk-help-preflight", choices)
+        reject = self._workflow_step(
+            workflow, "Reject consumed SDK help mode", "Test generic probe contracts")
+        self.assertNotIn("continue-on-error:", reject)
+        self._assert_step_condition(reject, "inputs.probe_mode == 'sdk-help-preflight'")
+        self.assertEqual([line.strip() for line in reject.splitlines()
+                          if line.strip().startswith("run:")],
+                         ['run: python3 -c "raise SystemExit(\'SDK_HELP_MODE_CONSUMED\')"'])
+        self.assertLess(workflow.index("- name: Read generic probe source"),
+                        workflow.index("- name: Reject consumed SDK help mode"))
+        self.assertLess(workflow.index("- name: Reject consumed SDK help mode"),
+                        workflow.index("- name: Test generic probe contracts"))
+        self._assert_focal_step_conditions(workflow)
+        dedicated = self._workflow_step(
+            workflow, "Inspect installed SDK help only", "Inspect selected generic lab mode")
+        self.assertNotIn("continue-on-error:", dedicated)
+        self._assert_step_condition(dedicated, "inputs.probe_mode == 'sdk-installed-help-docs-only'")
+        mapping = [line.strip() for line in dedicated.splitlines()
+                   if line.strip().startswith("SHORTCUTS_PROBE_EXECUTION_MODE:")]
+        self.assertEqual(mapping, ["SHORTCUTS_PROBE_EXECUTION_MODE: sdk-help-preflight"])
+        self.assertEqual([line.strip() for line in dedicated.splitlines()
+                          if line.strip().startswith("run:")],
+                         ["run: python3 probe/inspect_simulator.py"])
+        self.assertNotIn("${{", dedicated)
 
     def _focal_namespace(self):
         workflow = workflow_source(ROOT).read_text(encoding="utf-8")
@@ -94,9 +149,9 @@ class ProbeLayoutTests(unittest.TestCase):
     def test_focal_step_conditions_reject_individual_missing_guards(self) -> None:
         workflow = workflow_source(ROOT).read_text(encoding="utf-8")
         conditions = (
-            ("Test generic probe contracts", "if: inputs.probe_mode != 'sdk-posix-fixture-preflight'"),
+            ("Test generic probe contracts", f"if: {GENERIC_STEP_CONDITION}"),
             ("Test focal synthetic POSIX contracts", "if: inputs.probe_mode == 'sdk-posix-fixture-preflight'"),
-            ("Inspect selected generic lab mode", "if: inputs.probe_mode != 'sdk-posix-fixture-preflight'"),
+            ("Inspect selected generic lab mode", f"if: {GENERIC_STEP_CONDITION}"),
         )
         for step, condition in conditions:
             with self.subTest(step=step):
@@ -105,6 +160,69 @@ class ProbeLayoutTests(unittest.TestCase):
                 mutated = workflow[:condition_start] + workflow[condition_start + len(condition):]
                 with self.assertRaises(AssertionError):
                     self._assert_focal_step_conditions(mutated)
+
+    def test_installed_sdk_help_has_a_dedicated_edge_and_rejects_consumed_api_mode(self):
+        workflow = workflow_source(ROOT).read_text(encoding="utf-8")
+        self._assert_sdk_help_isolation(workflow)
+
+    def test_installed_sdk_help_rejects_individual_guard_and_mapping_mutations(self):
+        workflow = workflow_source(ROOT).read_text(encoding="utf-8")
+        changes = (
+            ("Reject consumed SDK help mode", "if: inputs.probe_mode == 'sdk-help-preflight'", "if: false"),
+            ("Reject consumed SDK help mode", 'run: python3 -c "raise SystemExit(\'SDK_HELP_MODE_CONSUMED\')"', 'run: python3 -c "raise SystemExit(0)"'),
+            ("Reject consumed SDK help mode", 'run: python3 -c "raise SystemExit(\'SDK_HELP_MODE_CONSUMED\')"', 'run: python3 -c "raise SystemExit(\'SDK_HELP_MODE_CONSUMED\')"\n        continue-on-error: true'),
+            ("Test generic probe contracts", f"if: {GENERIC_STEP_CONDITION}", "if: true"),
+            ("Test focal synthetic POSIX contracts", "if: inputs.probe_mode == 'sdk-posix-fixture-preflight'", "if: true"),
+            ("Inspect installed SDK help only", "if: inputs.probe_mode == 'sdk-installed-help-docs-only'", "if: true"),
+            ("Inspect installed SDK help only", "SHORTCUTS_PROBE_EXECUTION_MODE: sdk-help-preflight", "SHORTCUTS_PROBE_EXECUTION_MODE: ${{ inputs.probe_mode }}"),
+            ("Inspect installed SDK help only", "run: python3 probe/inspect_simulator.py", "run: python3 probe/sdk_stage_help.py"),
+            ("Inspect installed SDK help only", "run: python3 probe/inspect_simulator.py", "run: python3 probe/inspect_simulator.py\n        continue-on-error: true"),
+            ("Inspect selected generic lab mode", f"if: {GENERIC_STEP_CONDITION}", "if: true"),
+        )
+        for step, old, new in changes:
+            with self.subTest(step=step, changed=old):
+                offset = workflow.index(f"- name: {step}")
+                position = workflow.index(old, offset)
+                mutated = workflow[:position] + new + workflow[position + len(old):]
+                with self.assertRaises(AssertionError):
+                    self._assert_sdk_help_isolation(mutated)
+        for old, new in (("- sdk-installed-help-docs-only", "- sdk-help-preflight"),
+                         ("- sdk-posix-fixture-preflight", "- sdk-posix-fixture-preflight\n          - sdk-help-preflight")):
+            with self.subTest(choice=old):
+                with self.assertRaises(AssertionError):
+                    self._assert_sdk_help_isolation(workflow.replace(old, new, 1))
+
+    def test_installed_sdk_help_rejects_each_removed_exclusion_not_only_whole_if(self):
+        workflow = workflow_source(ROOT).read_text(encoding="utf-8")
+        for step in ("Test generic probe contracts", "Inspect selected generic lab mode"):
+            for clause in (" && inputs.probe_mode != 'sdk-installed-help-docs-only'",
+                           " && inputs.probe_mode != 'sdk-help-preflight'"):
+                with self.subTest(step=step, clause=clause):
+                    offset = workflow.index(f"- name: {step}")
+                    position = workflow.index(clause, offset)
+                    mutated = workflow[:position] + workflow[position + len(clause):]
+                    with self.assertRaises(AssertionError):
+                        self._assert_sdk_help_isolation(mutated)
+
+    def test_installed_sdk_help_mode_matrix_preserves_non_sdk_routes(self):
+        workflow = workflow_source(ROOT).read_text(encoding="utf-8")
+        self._assert_sdk_help_isolation(workflow)
+        names = ("Reject consumed SDK help mode", "Test generic probe contracts",
+                 "Test focal synthetic POSIX contracts", "Inspect installed SDK help only",
+                 "Inspect selected generic lab mode", "Preserve synthetic UI evidence")
+        bodies = [self._workflow_step(workflow, name, following)
+                  for name, following in zip(names, names[1:])]
+        old_non_sdk = ("open-handles", "lsof-preflight", "observed-shortcuts-schema",
+                       "synthetic-action-shape", "appium-host-preflight", "appium-session-preflight",
+                       "appium-wda-build-preflight", "appium-prebuilt-session-preflight",
+                       "wda-launch-preflight")
+        expected = {mode: [False, True, False, False, True] for mode in old_non_sdk}
+        expected.update({"sdk-posix-fixture-preflight": [False, False, True, False, False],
+                         "sdk-installed-help-docs-only": [False, False, False, True, False],
+                         "sdk-help-preflight": [True, False, False, False, False]})
+        for mode, decisions in expected.items():
+            with self.subTest(mode=mode):
+                self.assertEqual([self._step_selected(body, mode) for body in bodies], decisions)
 
     def test_focal_guard_prevents_import_and_records_unconfirmed_receipt(self) -> None:
         namespace = self._focal_namespace()
@@ -330,16 +448,17 @@ class ProbeLayoutTests(unittest.TestCase):
         self.assertIn("- appium-wda-build-preflight", workflow)
         self.assertIn("- appium-prebuilt-session-preflight", workflow)
         self.assertIn("- wda-launch-preflight", workflow)
-        self.assertIn("- sdk-help-preflight", workflow)
+        self._assert_sdk_help_isolation(workflow)
         self.assertIn("SHORTCUTS_PROBE_EXECUTION_MODE: ${{ inputs.probe_mode }}", workflow)
         self.assertIn("timeout-minutes: 15", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
-        tests = workflow.split("- name: Test generic probe contracts", 1)[1]
-        tests, inspect = tests.split("- name: Inspect selected generic lab mode", 1)
+        tests = self._workflow_step(
+            workflow, "Test generic probe contracts", "Test focal synthetic POSIX contracts")
+        inspect = self._workflow_step(
+            workflow, "Inspect selected generic lab mode", "Preserve synthetic UI evidence")
         self.assertNotIn("env:", tests)
         self.assertNotIn("SHORTCUTS_PROBE_EXECUTION_MODE", tests)
-        self.assertEqual(workflow.count("SHORTCUTS_PROBE_EXECUTION_MODE"), 1)
-        inspect = inspect.split("- name: Preserve synthetic UI evidence", 1)[0]
+        self.assertEqual(workflow.count("SHORTCUTS_PROBE_EXECUTION_MODE"), 2)
         self.assertIn("env:", inspect)
         self.assertIn("SHORTCUTS_PROBE_EXECUTION_MODE", inspect)
 

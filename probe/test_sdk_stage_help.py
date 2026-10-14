@@ -77,6 +77,8 @@ class SdkStageHelpUnitTests(unittest.TestCase):
                 ("darwin", "posix", None, False),
                 ("darwin", "posix", "false", False),
                 ("darwin", "posix", "true", True),
+                ("linux", "posix", "true", False),
+                ("darwin", "nt", "true", False),
                 ("win32", "nt", "true", False)):
             with self.subTest(platform=platform, os_name=os_name, actions=actions):
                 with mock.patch.object(sdk.sys, "platform", platform), \
@@ -313,6 +315,90 @@ class SdkStageHelpUnitTests(unittest.TestCase):
         self.assertFalse(result["cleanup_exited"])
         self.assertEqual(result["queries"], {})
         self.assertNotIn("PRIVATE_CAPTURE", str(result))
+
+    def test_run_uses_only_three_ordered_help_commands_and_sanitizes_observation(self):
+        expected_commands = [
+            ("simctl_spawn_help", ("/usr/bin/xcrun", "simctl", "help", "spawn")),
+            ("simctl_container_help", ("/usr/bin/xcrun", "simctl", "help", "get_app_container")),
+            ("log_manual", ("/usr/bin/man", "log")),
+        ]
+
+        def observed_query():
+            return {
+                "status": "observed", "timed_out": False, "over_limit": False,
+                "eof_confirmed": True, "process_group_drained": True,
+                "process_started": True, "discard_limit_reached": False,
+                "forced_cleanup": False, "exit_code": 0, "seconds": 0.1,
+                "topic_literal_count": 1, "PRIVATE": "not-retained",
+                "stdout": {"bytes": 5, "post_cleanup_discard_bytes": 0,
+                           "complete": True, "utf8": True, "sha256": "a" * 64,
+                           "literal_counts": {key: 0 for key in sdk.LITERALS},
+                           "raw": "not-retained"},
+                "stderr": {"bytes": 1, "post_cleanup_discard_bytes": 0,
+                           "complete": True, "utf8": True, "sha256": "b" * 64,
+                           "literal_counts": {key: 0 for key in sdk.LITERALS},
+                           "raw": "not-retained"},
+            }
+
+        def assert_canonical_argvs(calls):
+            self.assertEqual([call.args[0] for call in calls], [argv for _, argv in expected_commands])
+
+        with tempfile.TemporaryDirectory() as directory:
+            owned = Path(directory) / "appium-host-preflight-sdk-help-owned"
+            owned.mkdir()
+            identity = (owned.lstat().st_dev, owned.lstat().st_ino)
+            with mock.patch.object(sdk, "_supported_host", return_value=True), \
+                    mock.patch.object(sdk.tempfile, "mkdtemp", return_value=str(owned)), \
+                    mock.patch.object(sdk, "_capture_help", side_effect=[observed_query(), observed_query(), observed_query()]) as capture, \
+                    mock.patch.object(sdk, "_remove_owned_root") as remove, \
+                    mock.patch.object(sdk.subprocess, "Popen") as popen:
+                result = sdk.run_sdk_stage_help({"PRIVATE": "not-retained"})
+
+        expected_env = {
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(owned / "home"),
+            "TMPDIR": str(owned / "tmp"), "LANG": "C", "LC_ALL": "C",
+            "PAGER": "/bin/cat", "MANPAGER": "/bin/cat", "TERM": "dumb",
+        }
+        self.assertEqual(capture.call_count, 3)
+        assert_canonical_argvs(capture.call_args_list)
+        self.assertEqual(
+            [(call.args[0], call.args[1], call.args[2]) for call in capture.call_args_list],
+            [(argv, expected_env, owned) for _, argv in expected_commands],
+        )
+        popen.assert_not_called()
+        remove.assert_called_once_with(owned, identity)
+        self.assertEqual(result["scope"], "owned_sdk_help_only")
+        self.assertEqual(result["status"], "SDK_HELP_OBSERVED_ONLY")
+        self.assertFalse(result["unified_schema_confirmed"])
+        self.assertTrue(result["cleanup_exited"])
+        self.assertTrue(result["temporary_cleanup_confirmed"])
+        self.assertEqual(list(result["queries"]), [name for name, _ in expected_commands])
+        self.assertNotIn("PRIVATE", str(result))
+        for query in result["queries"].values():
+            self.assertNotIn("raw", str(query))
+            self.assertEqual(query["status"], "observed")
+            self.assertEqual(query["exit_code"], 0)
+
+        mutated_maps = (
+            dict(reversed(expected_commands)),
+            dict([("simctl_spawn_help", ("/usr/bin/xcrun", "simctl", "help", "list")), *expected_commands[1:]]),
+            dict([*expected_commands, ("unexpected_help", ("/usr/bin/man", "whatis"))]),
+        )
+        for altered in mutated_maps:
+            with self.subTest(altered_count=len(altered)):
+                with tempfile.TemporaryDirectory() as directory:
+                    altered_owned = Path(directory) / "appium-host-preflight-sdk-help-owned"
+                    altered_owned.mkdir()
+                    with mock.patch.dict(sdk.HELP_COMMANDS, altered, clear=True), \
+                            mock.patch.object(sdk, "_supported_host", return_value=True), \
+                            mock.patch.object(sdk.tempfile, "mkdtemp", return_value=str(altered_owned)), \
+                            mock.patch.object(sdk, "_capture_help", side_effect=[observed_query() for _ in altered]) as altered_capture, \
+                            mock.patch.object(sdk, "_remove_owned_root"), \
+                            mock.patch.object(sdk.subprocess, "Popen") as altered_popen:
+                        sdk.run_sdk_stage_help({})
+                altered_popen.assert_not_called()
+                with self.assertRaises(AssertionError):
+                    assert_canonical_argvs(altered_capture.call_args_list)
 
 
 @unittest.skipUnless(os.name == "posix", "requires POSIX process groups; intentionally skipped on Windows")

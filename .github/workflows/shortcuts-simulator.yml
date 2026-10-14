@@ -18,7 +18,7 @@ name: Shortcuts Simulator Inspection
           - appium-wda-build-preflight
           - appium-prebuilt-session-preflight
           - wda-launch-preflight
-          - sdk-help-preflight
+          - sdk-installed-help-docs-only
           - sdk-posix-fixture-preflight
 
 permissions:
@@ -37,8 +37,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Reject consumed SDK help mode
+        if: inputs.probe_mode == 'sdk-help-preflight'
+        run: python3 -c "raise SystemExit('SDK_HELP_MODE_CONSUMED')"
       - name: Test generic probe contracts
-        if: inputs.probe_mode != 'sdk-posix-fixture-preflight'
+        if: inputs.probe_mode != 'sdk-posix-fixture-preflight' && inputs.probe_mode != 'sdk-installed-help-docs-only' && inputs.probe_mode != 'sdk-help-preflight'
         run: python3 -m unittest discover -s probe -p 'test_*.py' -q
       - name: Test focal synthetic POSIX contracts
         if: inputs.probe_mode == 'sdk-posix-fixture-preflight'
@@ -195,8 +198,13 @@ jobs:
               raise SystemExit(code)
           # POSIX_FIXTURE_INLINE_END
           PY
+      - name: Inspect installed SDK help only
+        if: inputs.probe_mode == 'sdk-installed-help-docs-only'
+        env:
+          SHORTCUTS_PROBE_EXECUTION_MODE: sdk-help-preflight
+        run: python3 probe/inspect_simulator.py
       - name: Inspect selected generic lab mode
-        if: inputs.probe_mode != 'sdk-posix-fixture-preflight'
+        if: inputs.probe_mode != 'sdk-posix-fixture-preflight' && inputs.probe_mode != 'sdk-installed-help-docs-only' && inputs.probe_mode != 'sdk-help-preflight'
         env:
           SHORTCUTS_PROBE_EXECUTION_MODE: ${{ inputs.probe_mode }}
         run: |
