@@ -6,7 +6,13 @@ final class ShortcutsObservationTests: XCTestCase {
     private let syntheticPhrase = "AUTOMATION_TEST_ONLY"
 
     @MainActor
-    func testObserveMessageAutomationEditorWithoutRunningOrSaving() {
+    func testCreateSyntheticMessageFilterWithoutRunningOrExporting() {
+        let environment = ProcessInfo.processInfo.environment
+        let mode = environment["SHORTCUTS_PROBE_MODE"] ?? environment["TEST_RUNNER_SHORTCUTS_PROBE_MODE"]
+        guard mode == "schema-only" else {
+            XCTFail("PROBE_SCHEMA_ONLY_MODE_REQUIRED")
+            return
+        }
         let shortcuts = launchShortcutsOrFail()
         guard let shortcuts else { return }
 
@@ -37,42 +43,8 @@ final class ShortcutsObservationTests: XCTestCase {
             in: shortcuts,
             stage: "finish-filter-editing"
         ) else { return }
-        guard tapUnique(
-            shortcuts.navigationBars.buttons.matching(
-                NSPredicate(format: "label ENDSWITH %@", ", Actions Menu")
-            ),
-            in: shortcuts,
-            stage: "shortcut-actions-menu"
-        ) else { return }
-        print("PROBE_ACTIONS_MENU_OBSERVED=true")
-        guard tapUnique(
-            shortcuts.collectionViews.buttons.matching(NSPredicate(format: "label == %@", "Share")),
-            in: shortcuts,
-            stage: "shortcut-share-options"
-        ) else { return }
-        print("PROBE_SHARE_OPTIONS_OBSERVED=true")
-        guard tapObservedShareOptions(in: shortcuts) else { return }
-        guard selectObservedFileFormat(in: shortcuts) else { return }
-        guard tapUnique(
-            shortcuts.navigationBars.matching(identifier: "Options")
-                .buttons.matching(NSPredicate(format: "label == %@", "close")),
-            in: shortcuts,
-            stage: "finish-file-options"
-        ) else { return }
-        let activities = shortcuts.popovers.collectionViews.matching(identifier: "activityCollectionView")
-        guard activities.element(boundBy: 0).waitForExistence(timeout: stageTimeout), activities.count == 1 else {
-            _ = block(at: "native-file-picker", in: shortcuts, reason: "expected-one-share-activity-list")
-            return
-        }
-        let saveCells = activities.element(boundBy: 0).cells.matching(
-            NSPredicate(format: "identifier == %@ AND label == %@", "actionGroupCell", "Save to Files")
-        )
-        guard tapExactlyOne(
-            buttons: shortcuts.buttons.matching(NSPredicate(value: false)),
-            cells: saveCells, in: shortcuts, stage: "native-file-picker"
-        ) else { return }
-        print("PROBE_FILE_EXPORT_UI_ATTEMPTED=true")
-        print("PROBE_NO_RUN_OR_NETWORK_CODE=true")
+        print("PROBE_SYNTHETIC_FILTER_READY=true")
+        print("PROBE_NO_SHORTCUT_RUN_INVOKED=true")
     }
 
     @MainActor

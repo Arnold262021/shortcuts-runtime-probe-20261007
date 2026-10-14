@@ -224,7 +224,7 @@ def native_artifact_failure_code(stderr):
     return known.get(message, "COLLECTOR_FAILED_UNKNOWN")
 
 
-def collect_native_export(device_id, not_before_ns):
+def resolve_shortcuts_container(device_id):
     result = command(["xcrun", "simctl", "get_app_container", device_id,
                       "com.apple.shortcuts", "data"], timeout=20)
     try:
@@ -235,6 +235,11 @@ def collect_native_export(device_id, not_before_ns):
         raise RuntimeError("NATIVE_EXPORT_CONTAINER_UNCONFIRMED") from error
     if not container.is_relative_to(own_device) or container == own_device:
         raise RuntimeError("EXPORT_CONTAINER_OUTSIDE_OWN_SIMULATOR")
+    return container
+
+
+def collect_native_export(device_id, not_before_ns):
+    container = resolve_shortcuts_container(device_id)
     script = ("import sys; from pathlib import Path; from native_artifact import collect_shortcut_artifact; "
               "collect_shortcut_artifact(Path(sys.argv[1]), Path(sys.argv[2]), "
               "not_before_ns=int(sys.argv[3]))")
@@ -245,6 +250,49 @@ def collect_native_export(device_id, not_before_ns):
         raise RuntimeError("NATIVE_SHORTCUT_ARTIFACT_UNCONFIRMED:" +
                            native_artifact_failure_code(collected.stderr))
     return json.loads((ARTIFACTS / "synthetic.shortcut.receipt.json").read_text(encoding="utf-8"))
+
+
+def survey_native_schema(device_id):
+    container = resolve_shortcuts_container(device_id)
+    from native_store_schema import NativeStoreSchemaError, survey_shortcuts_schema
+    try:
+        survey = survey_shortcuts_schema(container)
+    except NativeStoreSchemaError as error:
+        raise RuntimeError("NATIVE_STORE_SCHEMA_UNCONFIRMED:" + str(error)) from error
+    (ARTIFACTS / "native-store-schema.json").write_text(json.dumps(survey, indent=2), encoding="utf-8")
+    return {"scope": "schema_only_no_rows_no_database_copy",
+            "sqlite_files": len(survey["databases"]), "condition_payload_proven": False}
+
+
+def collect_shortcuts_group_metadata(device_id):
+    help_result = command(["xcrun", "simctl", "help", "get_app_container"],
+                          timeout=10, check=False)
+    help_text = (help_result.stdout + help_result.stderr).decode("utf-8", "replace")
+    if "groups" not in help_text:
+        return {"status": "GROUPS_NOT_IN_NATIVE_HELP"}
+    result = command(["xcrun", "simctl", "get_app_container", device_id,
+                      "com.apple.shortcuts", "groups"], timeout=10, check=False)
+    if result.returncode:
+        return {"status": "GROUP_METADATA_COMMAND_FAILED"}
+    try:
+        groups = json.loads(result.stdout)
+        if not isinstance(groups, dict) or len(groups) > 8:
+            raise ValueError
+        own_data = (Path.home() / "Library/Developer/CoreSimulator/Devices" /
+                    device_id / "data").resolve(strict=True)
+        metadata = {}
+        for identifier, path in groups.items():
+            if (not isinstance(identifier, str) or len(identifier) > 128
+                    or not identifier.isascii() or not isinstance(path, str)):
+                raise ValueError
+            resolved = Path(path).resolve(strict=True)
+            if not resolved.is_relative_to(own_data) or resolved == own_data:
+                raise ValueError
+            metadata[identifier] = resolved.relative_to(own_data).as_posix()
+        return {"status": "GROUP_PATH_METADATA_ONLY", "groups": metadata,
+                "group_store_read": False}
+    except (ValueError, OSError, TypeError):
+        return {"status": "GROUP_METADATA_UNCONFIRMED"}
 
 
 def main():
@@ -290,7 +338,8 @@ def main():
             receipt["before_screenshot_exit"] = before.returncode
         except subprocess.TimeoutExpired:
             receipt["before_screenshot_exit"] = "timeout"
-        env = dict(SAFE_ENV, TEST_RUNNER_SHORTCUTS_BUNDLE_ID=bundle)
+        env = dict(SAFE_ENV, TEST_RUNNER_SHORTCUTS_BUNDLE_ID=bundle,
+                   TEST_RUNNER_SHORTCUTS_PROBE_MODE="schema-only")
         result_path = ROOT.parent / "ProbeResults.xcresult"
         build_args = [
             "xcodebuild", "test", *PROJECT_ARGS,
@@ -302,8 +351,7 @@ def main():
             "-maximum-test-execution-time-allowance", "180", *diagnostic_options,
             "CODE_SIGNING_ALLOWED=NO"
         ]
-        export_not_before_ns = time.time_ns()
-        receipt["export_not_before_ns"] = export_not_before_ns
+        receipt["synthetic_ui_started_ns"] = time.time_ns()
         try:
             build = diagnostic_command(build_args, "test-diagnostics.txt", timeout=480,
                                        env=env, simulator_id=device_id)
@@ -335,9 +383,11 @@ def main():
         if receipt["xcodebuild_exit"] != 0:
             raise RuntimeError("UI_TEST_FAILED")
         receipt["status"] = "UI_TEST_PASSED_ONLY"
-        if "PROBE_FILE_EXPORT_UI_ATTEMPTED=true" in diagnostics:
-            receipt["native_artifact"] = collect_native_export(device_id, export_not_before_ns)
-            receipt["status"] = "NATIVE_ARTIFACT_COLLECTED_ONLY"
+        if "PROBE_SYNTHETIC_FILTER_READY=true" not in diagnostics:
+            raise RuntimeError("SYNTHETIC_FILTER_STATE_UNCONFIRMED")
+        receipt["native_store_schema"] = survey_native_schema(device_id)
+        receipt["shortcuts_group_metadata"] = collect_shortcuts_group_metadata(device_id)
+        receipt["status"] = "NATIVE_STORE_SCHEMA_OBSERVED_ONLY"
         return 0
     except (RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
         receipt["status"] = "blocked"
