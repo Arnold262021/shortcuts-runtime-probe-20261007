@@ -47,7 +47,8 @@ class AppiumHostPreflightError(RuntimeError):
                  temporary_retained: bool = False, primary_code: str | None = None,
                  build_exit: int | None = None, build_stdout_bytes: int | None = None,
                  build_stderr_bytes: int | None = None, build_failure_category: str | None = None,
-                 build_stdout_sha256: str | None = None, build_stderr_sha256: str | None = None):
+                 build_stdout_sha256: str | None = None, build_stderr_sha256: str | None = None,
+                 wda_build: dict[str, object] | None = None):
         if code not in _ERRORS:
             raise ValueError("unknown appium host preflight code")
         super().__init__(code)
@@ -61,6 +62,7 @@ class AppiumHostPreflightError(RuntimeError):
         self.build_failure_category = build_failure_category
         self.build_stdout_sha256 = build_stdout_sha256
         self.build_stderr_sha256 = build_stderr_sha256
+        self.wda_build = wda_build
 
 
 def _text(value: object) -> str:
@@ -392,6 +394,64 @@ def _remove_owned_root(root: Path, identity: tuple[int, int]) -> None:
     shutil.rmtree(root)
 
 
+def _build_owned_wda(command: Callable[..., object], appium: Path, env: dict[str, str], root: Path) -> dict[str, object]:
+    """Compile and validate WDA in `root`; no server, session, boot, or test command."""
+    _run(command, [str(appium), "driver", "install", f"xcuitest@{XCUITEST_VERSION}"], env, 180,
+         "HOST_PREFLIGHT_DRIVER_INSTALL")
+    driver = _run(command, [str(appium), "driver", "list", "--installed", "--json"], env, 30,
+                  "HOST_WDA_DRIVER_METADATA")
+    xcuitest_version, install_text = _driver_install_metadata(getattr(driver, "stdout", b""))
+    install_path = Path(install_text)
+    if not install_path.is_absolute() or not _owned_regular(install_path, root, directory=True):
+        raise AppiumHostPreflightError("HOST_WDA_DRIVER_METADATA")
+    resolved = _run(command, ["node", "-e", _WDA_RESOLVE_SCRIPT, str(install_path)], env, 30,
+                    "HOST_WDA_RESOLVE")
+    resolve_body = _bounded_json(getattr(resolved, "stdout", b""), "HOST_WDA_RESOLVE")
+    try:
+        resolved_text = resolve_body["resolvedPath"]
+        if not isinstance(resolved_text, str) or not resolved_text:
+            raise ValueError("resolved")
+    except (KeyError, TypeError, ValueError):
+        raise AppiumHostPreflightError("HOST_WDA_RESOLVE") from None
+    package_json = Path(resolved_text)
+    if not package_json.is_absolute() or not _owned_regular(package_json, root, directory=False):
+        raise AppiumHostPreflightError("HOST_WDA_PACKAGE")
+    package_root = package_json.parent
+    project = package_root / "WebDriverAgent.xcodeproj"
+    pbxproj = project / "project.pbxproj"
+    if not (_owned_regular(package_root, root, directory=True)
+            and _owned_regular(project, root, directory=True)
+            and _owned_regular(pbxproj, root, directory=False)):
+        raise AppiumHostPreflightError("HOST_WDA_PACKAGE")
+    package_version, package_sha256 = _validated_wda_package(
+        _read_owned_bounded(package_json, root, "HOST_WDA_PACKAGE"))
+    before = _run(command, ["xcrun", "simctl", "list", "devices", "--json"], env, 30, "HOST_WDA_SIMCTL")
+    before_states = _simulator_states(getattr(before, "stdout", b""))
+    derived = root / "derived"
+    _run_wda_build(command, ["xcodebuild", "build-for-testing", "-project", str(project),
+                             "-derivedDataPath", str(derived), "-scheme", "WebDriverAgentRunner",
+                             "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator",
+                             "CODE_SIGNING_ALLOWED=NO"], env)
+    after = _run(command, ["xcrun", "simctl", "list", "devices", "--json"], env, 30, "HOST_WDA_SIMCTL")
+    after_states = _simulator_states(getattr(after, "stdout", b""))
+    if before_states != after_states:
+        raise AppiumHostPreflightError("HOST_WDA_SIMULATOR_STATE_CHANGED")
+    _validated_wda_outputs(derived, root)
+    return {
+        "xcuitest_version": xcuitest_version, "wda_package_version": package_version,
+        "wda_package_sha256": package_sha256, "build_exit": 0,
+        "runner_bundle_verified": True, "xctestrun_verified": True,
+        "simulator_state_unchanged": True, "simulator_device_count": len(after_states),
+        "private_paths": {"derived_data_path": str(derived)},
+    }
+
+
+def _safe_wda_build(result: dict[str, object] | None) -> dict[str, object] | None:
+    if result is None:
+        return None
+    return {key: value for key, value in result.items() if key != "private_paths"}
+
+
 def run_appium_host_preflight(command: Callable[..., object], safe_env: dict[str, str]) -> dict[str, object]:
     """Install pinned Appium temporarily, check localhost readiness, then stop it.
 
@@ -413,8 +473,16 @@ def run_appium_with_owned_server(command: Callable[..., object], safe_env: dict[
     return _run_owned_server(command, safe_env, probe)
 
 
+def run_appium_with_prebuilt_owned_server(command: Callable[..., object], safe_env: dict[str, str],
+                                          probe: Callable[[str, dict[str, str]], None]) -> dict[str, object]:
+    """Compile owned WDA before starting Appium, then call `probe` with private in-memory paths."""
+    if not callable(probe):
+        raise AppiumHostPreflightError("HOST_PREFLIGHT_CALLBACK_UNCONFIRMED")
+    return _run_owned_server(command, safe_env, probe, prebuild_wda=True)
+
+
 def _run_owned_server(command: Callable[..., object], safe_env: dict[str, str],
-                      on_ready: Callable[[str], None] | None = None) -> dict[str, object]:
+                      on_ready: Callable[..., None] | None = None, *, prebuild_wda: bool = False) -> dict[str, object]:
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise AppiumHostPreflightError("HOST_PREFLIGHT_UNSUPPORTED_ENVIRONMENT")
     env = {key: value for key, value in safe_env.items() if not key.upper().startswith("NPM_CONFIG_")}
@@ -425,6 +493,7 @@ def _run_owned_server(command: Callable[..., object], safe_env: dict[str, str],
     process = None
     cleanup_exited = None
     primary = None
+    wda_result: dict[str, object] | None = None
     try:
         npm_prefix = root / "npm"
         appium_home = root / "appium-home"
@@ -462,11 +531,15 @@ def _run_owned_server(command: Callable[..., object], safe_env: dict[str, str],
         version_result = _run(command, [str(appium), "--version"], env, 30, "HOST_PREFLIGHT_CLI_VERSION")
         if _version(getattr(version_result, "stdout", b"")) != APPIUM_VERSION:
             raise AppiumHostPreflightError("HOST_PREFLIGHT_CLI_VERSION")
-        _run(command, [str(appium), "driver", "install", f"xcuitest@{XCUITEST_VERSION}"], env, 180,
-             "HOST_PREFLIGHT_DRIVER_INSTALL")
-        driver = _run(command, [str(appium), "driver", "list", "--installed", "--json"], env, 30,
-                      "HOST_PREFLIGHT_DRIVER_VERSION")
-        installed_version = _driver_version(getattr(driver, "stdout", b""))
+        if prebuild_wda:
+            wda_result = _build_owned_wda(command, appium, env, root)
+            installed_version = wda_result["xcuitest_version"]
+        else:
+            _run(command, [str(appium), "driver", "install", f"xcuitest@{XCUITEST_VERSION}"], env, 180,
+                 "HOST_PREFLIGHT_DRIVER_INSTALL")
+            driver = _run(command, [str(appium), "driver", "list", "--installed", "--json"], env, 30,
+                          "HOST_PREFLIGHT_DRIVER_VERSION")
+            installed_version = _driver_version(getattr(driver, "stdout", b""))
         port = _free_port()
         server_args = [str(appium), "server", "--address", "127.0.0.1", "--port", str(port), "--tmp", str(tmp_dir), "--use-drivers", "xcuitest"]
         with (root / "server.stdout").open("wb") as stdout, (root / "server.stderr").open("wb") as stderr:
@@ -500,7 +573,13 @@ def _run_owned_server(command: Callable[..., object], safe_env: dict[str, str],
                 raise
             if on_ready is not None:
                 try:
-                    on_ready(f"http://127.0.0.1:{port}")
+                    if prebuild_wda:
+                        private_paths = wda_result["private_paths"] if wda_result is not None else None
+                        if not isinstance(private_paths, dict):
+                            raise ValueError("prebuilt paths")
+                        on_ready(f"http://127.0.0.1:{port}", private_paths)
+                    else:
+                        on_ready(f"http://127.0.0.1:{port}")
                 except Exception:
                     raise AppiumHostPreflightError("HOST_PREFLIGHT_CALLBACK_UNCONFIRMED") from None
     except AppiumHostPreflightError as error:
@@ -517,12 +596,28 @@ def _run_owned_server(command: Callable[..., object], safe_env: dict[str, str],
     if cleanup_exited is False:
         raise AppiumHostPreflightError("HOST_PREFLIGHT_CLEANUP_UNCONFIRMED", cleanup_exited=False,
                                       temporary_retained=True,
-                                      primary_code=primary.code if primary else None) from None
+                                      primary_code=primary.code if primary else None,
+                                      build_exit=primary.build_exit if primary else None,
+                                      build_stdout_bytes=primary.build_stdout_bytes if primary else None,
+                                      build_stderr_bytes=primary.build_stderr_bytes if primary else None,
+                                      build_failure_category=primary.build_failure_category if primary else None,
+                                      build_stdout_sha256=primary.build_stdout_sha256 if primary else None,
+                                      build_stderr_sha256=primary.build_stderr_sha256 if primary else None,
+                                      wda_build=_safe_wda_build(wda_result)) from None
     if primary is not None:
-        raise AppiumHostPreflightError(primary.code, cleanup_exited=cleanup_exited) from None
-    return {"node_version": node_version, "npm_version": npm_version, "appium_version": APPIUM_VERSION,
+        raise AppiumHostPreflightError(
+            primary.code, cleanup_exited=cleanup_exited, build_exit=primary.build_exit,
+            build_stdout_bytes=primary.build_stdout_bytes, build_stderr_bytes=primary.build_stderr_bytes,
+            build_failure_category=primary.build_failure_category,
+            build_stdout_sha256=primary.build_stdout_sha256, build_stderr_sha256=primary.build_stderr_sha256,
+            wda_build=_safe_wda_build(wda_result),
+        ) from None
+    result = {"node_version": node_version, "npm_version": npm_version, "appium_version": APPIUM_VERSION,
             "xcuitest_version": installed_version, "status_ready": True, "status_version_match": True,
             "cleanup_exited": True, "duration_ms": int((time.monotonic() - started) * 1000)}
+    if wda_result is not None:
+        result["wda_build"] = _safe_wda_build(wda_result)
+    return result
 
 
 def run_appium_wda_build_preflight(command: Callable[..., object], safe_env: dict[str, str]) -> dict[str, object]:
@@ -568,54 +663,14 @@ def run_appium_wda_build_preflight(command: Callable[..., object], safe_env: dic
         version_result = _run(command, [str(appium), "--version"], env, 30, "HOST_PREFLIGHT_CLI_VERSION")
         if _version(getattr(version_result, "stdout", b"")) != APPIUM_VERSION:
             raise AppiumHostPreflightError("HOST_PREFLIGHT_CLI_VERSION")
-        _run(command, [str(appium), "driver", "install", f"xcuitest@{XCUITEST_VERSION}"], env, 180,
-             "HOST_PREFLIGHT_DRIVER_INSTALL")
-        driver = _run(command, [str(appium), "driver", "list", "--installed", "--json"], env, 30,
-                      "HOST_WDA_DRIVER_METADATA")
-        xcuitest_version, install_text = _driver_install_metadata(getattr(driver, "stdout", b""))
-        install_path = Path(install_text)
-        if not install_path.is_absolute() or not _owned_regular(install_path, root, directory=True):
-            raise AppiumHostPreflightError("HOST_WDA_DRIVER_METADATA")
-        resolved = _run(command, ["node", "-e", _WDA_RESOLVE_SCRIPT, str(install_path)], env, 30,
-                        "HOST_WDA_RESOLVE")
-        resolve_body = _bounded_json(getattr(resolved, "stdout", b""), "HOST_WDA_RESOLVE")
-        try:
-            resolved_text = resolve_body["resolvedPath"]
-            if not isinstance(resolved_text, str) or not resolved_text:
-                raise ValueError("resolved")
-        except (KeyError, TypeError, ValueError):
-            raise AppiumHostPreflightError("HOST_WDA_RESOLVE") from None
-        package_json = Path(resolved_text)
-        if not package_json.is_absolute() or not _owned_regular(package_json, root, directory=False):
-            raise AppiumHostPreflightError("HOST_WDA_PACKAGE")
-        package_root = package_json.parent
-        project = package_root / "WebDriverAgent.xcodeproj"
-        pbxproj = project / "project.pbxproj"
-        if not (_owned_regular(package_root, root, directory=True)
-                and _owned_regular(project, root, directory=True)
-                and _owned_regular(pbxproj, root, directory=False)):
-            raise AppiumHostPreflightError("HOST_WDA_PACKAGE")
-        package_data = _read_owned_bounded(package_json, root, "HOST_WDA_PACKAGE")
-        package_version, package_sha256 = _validated_wda_package(package_data)
-        before = _run(command, ["xcrun", "simctl", "list", "devices", "--json"], env, 30, "HOST_WDA_SIMCTL")
-        before_states = _simulator_states(getattr(before, "stdout", b""))
-        derived = root / "derived"
-        _run_wda_build(command, ["xcodebuild", "build-for-testing", "-project", str(project),
-                                 "-derivedDataPath", str(derived), "-scheme", "WebDriverAgentRunner",
-                                 "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator",
-                                 "CODE_SIGNING_ALLOWED=NO"], env)
-        after = _run(command, ["xcrun", "simctl", "list", "devices", "--json"], env, 30, "HOST_WDA_SIMCTL")
-        after_states = _simulator_states(getattr(after, "stdout", b""))
-        if before_states != after_states:
-            raise AppiumHostPreflightError("HOST_WDA_SIMULATOR_STATE_CHANGED")
-        _validated_wda_outputs(derived, root)
+        wda_result = _build_owned_wda(command, appium, env, root)
         result = {
             "status": "HOST_WDA_COMPILED_ONLY", "build_exit": 0,
             "runner_bundle_verified": True, "xctestrun_verified": True,
-            "simulator_state_unchanged": True,
-            "simulator_device_count": len(after_states), "wda_package_version": package_version,
-            "wda_package_sha256": package_sha256,
-            "xcuitest_version": xcuitest_version, "cleanup_exited": True,
+            "simulator_state_unchanged": True, "simulator_device_count": wda_result["simulator_device_count"],
+            "wda_package_version": wda_result["wda_package_version"],
+            "wda_package_sha256": wda_result["wda_package_sha256"],
+            "xcuitest_version": wda_result["xcuitest_version"], "cleanup_exited": True,
             "duration_ms": int((time.monotonic() - started) * 1000),
         }
     except AppiumHostPreflightError as error:

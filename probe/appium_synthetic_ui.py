@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import re
 import time
 import urllib.error
@@ -400,7 +401,22 @@ class _Fixture:
             raise _Stop(stage, "library_nonempty_unconfirmed")
 
 
-def _effective_capabilities_match(value: Any, simulator_id: str) -> bool:
+def _valid_prebuilt_wda(value: object) -> str | None:
+    if type(value) is not dict or set(value) != {"derived_data_path"}:
+        return None
+    candidate = dict(value)
+    path = candidate["derived_data_path"]
+    if type(path) is not str or not path or "\x00" in path:
+        return None
+    normalized_parts = path.replace("\\", "/").split("/")
+    if ".." in normalized_parts:
+        return None
+    if not (pathlib.PurePosixPath(path).is_absolute() or pathlib.PureWindowsPath(path).is_absolute()):
+        return None
+    return path
+
+
+def _effective_capabilities_match(value: Any, simulator_id: str, prebuilt_wda_path: str | None = None) -> bool:
     if not isinstance(value, dict):
         return False
 
@@ -423,7 +439,7 @@ def _effective_capabilities_match(value: Any, simulator_id: str) -> bool:
     bundle_ok, bundle_id = cap("bundleId")
     automation_ok, automation_name = cap("automationName")
     idle_ok, idle_timeout = cap("waitForIdleTimeout")
-    return (
+    required_match = (
         udid_ok
         and bundle_ok
         and automation_ok
@@ -436,9 +452,27 @@ def _effective_capabilities_match(value: Any, simulator_id: str) -> bool:
         and type(idle_timeout) is int
         and idle_timeout == 0
     )
+    if prebuilt_wda_path is None:
+        return required_match
+    prebuilt_ok, use_prebuilt_wda = cap("usePrebuiltWDA")
+    derived_data_ok, derived_data_path = cap("derivedDataPath")
+    return (
+        required_match
+        and prebuilt_ok
+        and use_prebuilt_wda is True
+        and derived_data_ok
+        and type(derived_data_path) is str
+        and derived_data_path == prebuilt_wda_path
+    )
 
 
-def run_synthetic_appium_fixture(base_url: str, own_simulator_id: str, *, mode: str = "session-only") -> dict[str, object]:
+def run_synthetic_appium_fixture(
+    base_url: str,
+    own_simulator_id: str,
+    *,
+    mode: str = "session-only",
+    prebuilt_wda: dict | None = None,
+) -> dict[str, object]:
     """Run the approved fixture or its session-only gate on caller-owned resources."""
     started = time.monotonic()
     metrics = {"requests": 0, "read_polls": 0}
@@ -448,6 +482,8 @@ def run_synthetic_appium_fixture(base_url: str, own_simulator_id: str, *, mode: 
         "nonempty_after_relaunch": False,
         "session_initialized": False,
         "idle0": False,
+        "prebuilt_wda_requested": False,
+        "prebuilt_wda_verified": False,
         "stage": "input_validation",
         "failure_code": None,
         "primary_stage": None,
@@ -460,6 +496,12 @@ def run_synthetic_appium_fixture(base_url: str, own_simulator_id: str, *, mode: 
         result["failure_code"] = "invalid_local_endpoint_or_simulator_id"
         metrics["elapsed_ms"] = int((time.monotonic() - started) * 1000)
         return result
+    prebuilt_wda_path = None if prebuilt_wda is None else _valid_prebuilt_wda(prebuilt_wda)
+    if prebuilt_wda is not None and prebuilt_wda_path is None:
+        result["failure_code"] = "invalid_prebuilt_wda"
+        metrics["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        return result
+    result["prebuilt_wda_requested"] = prebuilt_wda_path is not None
     wire = _Wire(base_url, metrics, started + _SETUP_SECONDS)
     session_id: str | None = None
     primary_failure: _Stop | None = None
@@ -475,6 +517,9 @@ def run_synthetic_appium_fixture(base_url: str, own_simulator_id: str, *, mode: 
             "appium:newCommandTimeout": 60,
             "appium:wdaLaunchTimeout": 180000,
         }
+        if prebuilt_wda_path is not None:
+            capabilities["appium:usePrebuiltWDA"] = True
+            capabilities["appium:derivedDataPath"] = prebuilt_wda_path
         session_create_attempted = True
         created = wire.request("POST", "/session", {"capabilities": {"alwaysMatch": capabilities, "firstMatch": [{}]}}, mutation=True, setup=True)
         if not isinstance(created, dict):
@@ -483,12 +528,13 @@ def run_synthetic_appium_fixture(base_url: str, own_simulator_id: str, *, mode: 
         actual_caps = created.get("capabilities")
         if not isinstance(candidate, str) or not candidate or len(candidate) > 128 or not candidate.isascii():
             raise _Stop("session", "invalid_wire_response")
-        if not _effective_capabilities_match(actual_caps, own_simulator_id):
+        if not _effective_capabilities_match(actual_caps, own_simulator_id, prebuilt_wda_path):
             session_id = candidate
             raise _Stop("session", "effective_capabilities_unconfirmed")
         session_id = candidate
         result["session_initialized"] = True
         result["idle0"] = True
+        result["prebuilt_wda_verified"] = prebuilt_wda_path is not None
         wire.begin_commands()
         fixture = _Fixture(wire, session_id, metrics)
         if mode == "session-only":

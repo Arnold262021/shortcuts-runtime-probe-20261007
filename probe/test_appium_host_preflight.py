@@ -198,7 +198,8 @@ class AppiumHostPreflightTests(unittest.TestCase):
                                                 mock.call(1234, 9)])
 
     def _exercise_wda(self, *, changed=False, bad_output=False, bad_install=False,
-                      private_version=False, escape=False, build_failure=None, wrong_bundle=False):
+                      private_version=False, escape=False, build_failure=None, wrong_bundle=False,
+                      prebuilt=False):
         seen = []
         simctl_calls = 0
 
@@ -212,7 +213,7 @@ class AppiumHostPreflightTests(unittest.TestCase):
             elif args == ["npm", "--version"]:
                 stdout = b"10.9.2"
             elif "--help" in args:
-                stdout = b"driver install list --installed --json"
+                stdout = b"driver install list --installed --json --address --port --tmp --use-drivers"
             elif "--version" in args:
                 stdout = b"3.8.0"
             elif args[0] == "node" and args[1] == "-e":
@@ -258,11 +259,30 @@ class AppiumHostPreflightTests(unittest.TestCase):
                 stdout = b""
             return SimpleNamespace(returncode=0, stdout=stdout)
 
+        process = mock.Mock()
+        process.poll.return_value = None
+
+        def start(*args, **kwargs):
+            seen.append((["Popen"], {}))
+            return process
+
         with mock.patch.object(preflight.sys, "platform", "darwin"), \
                 mock.patch.dict(preflight.os.environ, {"GITHUB_ACTIONS": "true"}), \
-                mock.patch.object(preflight.subprocess, "Popen") as popen:
+                mock.patch.object(preflight.subprocess, "Popen", side_effect=start) as popen, \
+                mock.patch.object(preflight, "_read_status", return_value={"value": {"ready": True, "build": {"version": "3.8.0"}}}), \
+                mock.patch.object(preflight, "_cleanup", return_value=True):
             try:
-                result = preflight.run_appium_wda_build_preflight(command, {"PATH": os.environ["PATH"]})
+                if prebuilt:
+                    callback_events = []
+
+                    def probe(url, paths):
+                        callback_events.append((url, paths))
+                        self.assertTrue(Path(paths["derived_data_path"]).exists())
+
+                    result = preflight.run_appium_with_prebuilt_owned_server(command, {"PATH": os.environ["PATH"]}, probe)
+                    result = (result, callback_events)
+                else:
+                    result = preflight.run_appium_wda_build_preflight(command, {"PATH": os.environ["PATH"]})
             except preflight.AppiumHostPreflightError as error:
                 result = error
         return result, seen, popen
@@ -286,6 +306,25 @@ class AppiumHostPreflightTests(unittest.TestCase):
         self.assertNotIn("server", str(commands))
         self.assertNotIn("session", str(commands).lower())
         self.assertNotIn("boot", str(commands).lower())
+
+    def test_prebuilt_server_compiles_before_popen_and_keeps_paths_private(self):
+        combined, seen, popen = self._exercise_wda(prebuilt=True)
+        result, callbacks = combined
+        self.assertTrue(result["wda_build"]["runner_bundle_verified"])
+        self.assertTrue(result["wda_build"]["xctestrun_verified"])
+        self.assertEqual(result["wda_build"]["build_exit"], 0)
+        self.assertNotIn("derived_data_path", result)
+        self.assertEqual(len(callbacks), 1)
+        commands = [args for args, _ in seen]
+        self.assertLess(next(index for index, args in enumerate(commands) if args[0] == "xcodebuild"),
+                        next(index for index, args in enumerate(commands) if args[0] == "Popen"))
+        popen.assert_called_once()
+
+    def test_prebuilt_build_failure_starts_no_server_or_callback(self):
+        result, _, popen = self._exercise_wda(prebuilt=True, build_failure=b"PRIVATE_FAILURE")
+        self.assertEqual(result.code, "HOST_WDA_BUILD")
+        self.assertEqual(result.build_failure_category, "unknown")
+        popen.assert_not_called()
 
     def test_wda_build_rejects_state_change_and_missing_owned_metadata_or_outputs(self):
         changed, _, popen = self._exercise_wda(changed=True)

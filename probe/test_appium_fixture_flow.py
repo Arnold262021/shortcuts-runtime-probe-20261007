@@ -177,14 +177,19 @@ class _FixtureWire:
 
     def _answer(self, method, path, body):
         if path == "/session" and method == "POST":
+            requested = body["capabilities"]["alwaysMatch"]
+            capabilities = {
+                "udid": self.uuid,
+                "bundleId": "com.apple.shortcuts",
+                "automationName": "XCUITest",
+                "waitForIdleTimeout": 0,
+            }
+            if requested.get("appium:usePrebuiltWDA") is True:
+                capabilities["usePrebuiltWDA"] = True
+                capabilities["derivedDataPath"] = requested["appium:derivedDataPath"]
             return {
                 "sessionId": self.session,
-                "capabilities": {
-                    "udid": self.uuid,
-                    "bundleId": "com.apple.shortcuts",
-                    "automationName": "XCUITest",
-                    "waitForIdleTimeout": 0,
-                },
+                "capabilities": capabilities,
             }
         if path == "/session/" + self.session and method == "DELETE":
             return None
@@ -259,9 +264,9 @@ class _FixtureWire:
 
 
 class FixtureFlowTests(unittest.TestCase):
-    def _run(self, wire):
+    def _run(self, wire, **kwargs):
         with patch("urllib.request.build_opener", return_value=wire):
-            return subject.run_synthetic_appium_fixture(wire.endpoint, wire.uuid, mode="fixture")
+            return subject.run_synthetic_appium_fixture(wire.endpoint, wire.uuid, mode="fixture", **kwargs)
 
     def _assert_one_cleanup(self, wire):
         cleanup = [call for call in wire.calls if call[0] == "DELETE"]
@@ -288,6 +293,17 @@ class FixtureFlowTests(unittest.TestCase):
         self.assertNotIn("mobile: activateApp", scripts[:terminate])
         self.assertEqual(scripts[terminate + 1:].count("mobile: activateApp"), 1)
         self._assert_one_cleanup(wire)
+
+    def test_fixture_flow_supports_prebuilt_wda_only_when_requested(self):
+        private_path = "/private/var/folders/PRIVATE_SENTINEL/DerivedData"
+        wire = _FixtureWire(shortcuts_onboarding=True)
+        result = self._run(wire, prebuilt_wda={"derived_data_path": private_path})
+        requested = wire.calls[0][2]["capabilities"]["alwaysMatch"]
+        self.assertTrue(requested["appium:usePrebuiltWDA"])
+        self.assertEqual(requested["appium:derivedDataPath"], private_path)
+        self.assertTrue(result["prebuilt_wda_requested"])
+        self.assertTrue(result["prebuilt_wda_verified"])
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
         forbidden = ("Run", "Share", "SaveToFiles", "SMS", "source")
         self.assertFalse(any(any(word in path or word in json.dumps(body) for word in forbidden) for _, path, body, _ in wire.calls))
         self.assertTrue(all(url_path.startswith("/session") for _, url_path, _, _ in wire.calls))

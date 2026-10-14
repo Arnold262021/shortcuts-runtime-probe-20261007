@@ -658,17 +658,40 @@ def host_lsof_field_preflight():
             "fixture_handle_observed": True}
 
 
-def appium_session_preflight(device_id, *, prepare_device=None):
+def wda_failure_diagnostic(error):
+    observed = {}
+    for field in ("build_exit", "build_stdout_bytes", "build_stderr_bytes"):
+        value = getattr(error, field, None)
+        if type(value) is int and (field == "build_exit" or value >= 0):
+            observed[field] = value
+    category = getattr(error, "build_failure_category", None)
+    if isinstance(category, str) and category in {"destination_not_supported", "compiler_error", "signing_error", "unknown"}:
+        observed["build_failure_category"] = category
+    for field in ("build_stdout_sha256", "build_stderr_sha256"):
+        value = getattr(error, field, None)
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
+            observed[field] = value
+    return observed
+
+
+def appium_session_preflight(device_id, *, prepare_device=None, prebuild_wda=False):
     from appium_host_preflight import AppiumHostPreflightError, run_appium_with_owned_server
     from appium_synthetic_ui import run_synthetic_appium_fixture
 
     observed = {"scope": "owned_simulator_session_only", "ui_gestures_run": False,
                 "library_read": False, "condition_payload_proven": False}
 
-    def probe(base_url):
+    def probe(base_url, prebuilt_options=None):
+        if prebuild_wda and (not isinstance(prebuilt_options, dict) or set(prebuilt_options) != {"derived_data_path"}
+                            or not isinstance(prebuilt_options.get("derived_data_path"), str)
+                            or not prebuilt_options["derived_data_path"]):
+            observed["session"] = {"stage": "prebuilt_input", "failure_code": "prebuilt_wda_input_unconfirmed"}
+            return
         session_device_id = device_id
         if prepare_device is not None:
             observed["host_ready_before_device_preparation"] = True
+            if prebuild_wda:
+                observed["host_prebuilt_before_device_preparation"] = True
             try:
                 session_device_id = prepare_device()
             except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError):
@@ -678,23 +701,43 @@ def appium_session_preflight(device_id, *, prepare_device=None):
         if DEADLINE is not None and DEADLINE - time.monotonic() < 240:
             observed["session"] = {"stage": "budget", "failure_code": "session_budget_exhausted"}
             return
-        observed["session"] = run_synthetic_appium_fixture(base_url, session_device_id, mode="session-only")
+        if prebuild_wda:
+            observed["session"] = run_synthetic_appium_fixture(
+                base_url, session_device_id, mode="session-only", prebuilt_wda=dict(prebuilt_options))
+        else:
+            observed["session"] = run_synthetic_appium_fixture(base_url, session_device_id, mode="session-only")
 
     try:
-        observed["host"] = run_appium_with_owned_server(command, SAFE_ENV, probe)
+        if prebuild_wda:
+            from appium_host_preflight import run_appium_with_prebuilt_owned_server
+            observed["host"] = run_appium_with_prebuilt_owned_server(command, SAFE_ENV, probe)
+        else:
+            observed["host"] = run_appium_with_owned_server(command, SAFE_ENV, probe)
     except AppiumHostPreflightError as error:
         observed.update(status=error.code, cleanup_exited=error.cleanup_exited,
                         temporary_retained=error.temporary_retained)
         if error.primary_code is not None:
             observed["primary_failure"] = error.primary_code
+        diagnostic = wda_failure_diagnostic(error)
+        if diagnostic:
+            observed["wda_build_failure"] = diagnostic
         return observed
     session = observed.get("session", {})
+    prebuilt_ok = True
+    if prebuild_wda:
+        host = observed.get("host", {})
+        build = host.get("wda_build", {}) if isinstance(host, dict) else {}
+        prebuilt_ok = (isinstance(build, dict) and type(build.get("build_exit")) is int
+                       and build.get("build_exit") == 0 and build.get("runner_bundle_verified") is True
+                       and build.get("xctestrun_verified") is True and build.get("simulator_state_unchanged") is True
+                       and host.get("cleanup_exited") is True and isinstance(session, dict)
+                       and session.get("prebuilt_wda_requested") is True and session.get("prebuilt_wda_verified") is True)
     if (not isinstance(session, dict) or session.get("failure_code") is not None or session.get("stage") != "session_only_completed"
             or session.get("session_initialized") is not True or session.get("idle0") is not True
-            or session.get("cleanup_unconfirmed") is not False):
+            or session.get("cleanup_unconfirmed") is not False or not prebuilt_ok):
         observed["status"] = "APPIUM_SESSION_UNCONFIRMED"
     else:
-        observed["status"] = "APPIUM_SESSION_READY_ONLY"
+        observed["status"] = "APPIUM_PREBUILT_SESSION_READY_ONLY" if prebuild_wda else "APPIUM_SESSION_READY_ONLY"
     return observed
 
 
@@ -705,7 +748,7 @@ def main():
     mode = os.environ.get("SHORTCUTS_PROBE_EXECUTION_MODE", "open-handles")
     if mode not in {"open-handles", "lsof-preflight", "observed-shortcuts-schema",
                     "synthetic-action-shape", "appium-host-preflight", "appium-session-preflight",
-                    "appium-wda-build-preflight"}:
+                    "appium-wda-build-preflight", "appium-prebuilt-session-preflight"}:
         raise RuntimeError("UNKNOWN_PROBE_EXECUTION_MODE")
     ARTIFACTS.mkdir(exist_ok=False)
     TIMINGS.clear()
@@ -728,18 +771,7 @@ def main():
                 receipt["appium_temporary_retained"] = error.temporary_retained
                 if error.primary_code is not None:
                     receipt["appium_primary_failure"] = error.primary_code
-                build_diagnostic = {}
-                for field in ("build_exit", "build_stdout_bytes", "build_stderr_bytes"):
-                    value = getattr(error, field, None)
-                    if type(value) is int and (field == "build_exit" or value >= 0):
-                        build_diagnostic[field] = value
-                category = getattr(error, "build_failure_category", None)
-                if isinstance(category, str) and category in {"destination_not_supported", "compiler_error", "signing_error", "unknown"}:
-                    build_diagnostic["build_failure_category"] = category
-                for field in ("build_stdout_sha256", "build_stderr_sha256"):
-                    value = getattr(error, field, None)
-                    if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
-                        build_diagnostic[field] = value
+                build_diagnostic = wda_failure_diagnostic(error)
                 if build_diagnostic:
                     receipt["appium_wda_build_failure"] = build_diagnostic
                 raise RuntimeError(error.code) from None
@@ -770,7 +802,8 @@ def main():
                            ui_run=False, shortcuts_association_proven=False)
             receipt.update(host_lsof_field_preflight())
             return 0
-        session_only = mode == "appium-session-preflight"
+        prebuild_wda = mode == "appium-prebuilt-session-preflight"
+        session_only = mode in {"appium-session-preflight", "appium-prebuilt-session-preflight"}
         if not session_only:
             receipt["native_timeout_probe"] = native_timeout_probe()
             print("PROBE_NATIVE_TIMEOUT=" + json.dumps(receipt["native_timeout_probe"]), flush=True)
@@ -789,7 +822,9 @@ def main():
         if session_only:
             receipt.update(scope="fresh_account_free_session_only", simulator_started=False,
                            xcode_test_suite_run=False, ui_gestures_run=False, page_source_read=False,
-                           store_read=False)
+                           store_read=False, native_probe_xcode_test_suite_run=False)
+            if prebuild_wda:
+                receipt.update(scope="fresh_account_free_prebuilt_requested_session_only", prebuilt_wda_mode=True)
 
             def prepare_device():
                 nonlocal device_id
@@ -804,7 +839,8 @@ def main():
                 receipt["simulator_started"] = True
                 return device_id
 
-            observed = appium_session_preflight(None, prepare_device=prepare_device)
+            observed = (appium_session_preflight(None, prepare_device=prepare_device, prebuild_wda=True)
+                        if prebuild_wda else appium_session_preflight(None, prepare_device=prepare_device))
             receipt["appium_preflight"] = observed
             receipt["status"] = observed["status"]
             if device_id is not None:
@@ -821,7 +857,8 @@ def main():
             if receipt["cleanup_errors"]:
                 receipt["status_before_simulator_cleanup"] = observed["status"]
                 raise RuntimeError("SIMULATOR_CLEANUP_UNCONFIRMED")
-            if observed["status"] != "APPIUM_SESSION_READY_ONLY":
+            expected_status = "APPIUM_PREBUILT_SESSION_READY_ONLY" if prebuild_wda else "APPIUM_SESSION_READY_ONLY"
+            if observed["status"] != expected_status:
                 raise RuntimeError(observed["status"])
             return 0
         created = command(["xcrun", "simctl", "create", "Synthetic-Shortcuts-Probe",

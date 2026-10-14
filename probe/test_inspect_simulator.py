@@ -901,6 +901,117 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(probe.choose_device(self.runtimes, self.devices, self.types),
                          ("com.apple.CoreSimulator.SimRuntime.iOS-27-0", "test.iphone"))
 
+    def test_prebuilt_session_mode_still_never_uses_native_ui_or_store(self):
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+        for status, expected in (("APPIUM_PREBUILT_SESSION_READY_ONLY", 0), ("APPIUM_SESSION_READY_ONLY", 1)):
+            seen = []
+
+            def fake_command(args, **kwargs):
+                seen.append(args)
+                return probe.subprocess.CompletedProcess(args, 0,
+                    identifier.encode() if args[1:3] == ["simctl", "create"] else b"", b"")
+
+            def fake_session(device_id, *, prepare_device, prebuild_wda):
+                self.assertTrue(prebuild_wda)
+                seen.append(["BUILD_AND_HOST_READY"])
+                self.assertEqual(prepare_device(), identifier)
+                return {"status": status}
+
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                    patch.object(probe.sys, "platform", "darwin"), \
+                    patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                               "SHORTCUTS_PROBE_EXECUTION_MODE": "appium-prebuilt-session-preflight"}), \
+                    patch.object(probe, "sim_json", side_effect=[self.runtimes, self.devices, self.types]), \
+                    patch.object(probe, "command", side_effect=fake_command), \
+                    patch.object(probe, "appium_session_preflight", side_effect=fake_session), \
+                    patch.object(probe, "native_timeout_probe") as timeout_probe, patch("builtins.print"):
+                self.assertEqual(probe.main(), expected)
+                self.open_probe.assert_not_called()
+                self.schema_probe.assert_not_called()
+                timeout_probe.assert_not_called()
+                self.assertLess(seen.index(["BUILD_AND_HOST_READY"]), next(
+                    i for i, args in enumerate(seen) if args[1:3] == ["simctl", "create"]))
+                self.assertEqual(seen.count(["xcrun", "simctl", "shutdown", identifier]), 1)
+                self.assertEqual(seen.count(["xcrun", "simctl", "delete", identifier]), 1)
+                receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+                self.assertTrue(receipt["prebuilt_wda_mode"])
+                self.assertFalse(receipt["native_probe_xcode_test_suite_run"])
+                self.assertFalse(receipt["ui_gestures_run"])
+                self.assertFalse(receipt["page_source_read"])
+                self.assertFalse(receipt["store_read"])
+                self.assertFalse(receipt["otp_proven"])
+
+    def test_prebuilt_requires_both_host_build_and_effective_caps_without_private_paths(self):
+        good_build = {"build_exit": 0, "runner_bundle_verified": True,
+                      "xctestrun_verified": True, "simulator_state_unchanged": True}
+        good_session = {"stage": "session_only_completed", "session_initialized": True, "idle0": True,
+                        "cleanup_unconfirmed": False, "failure_code": None,
+                        "prebuilt_wda_requested": True, "prebuilt_wda_verified": True}
+        cases = [(dict(good_build), dict(good_session), True, 0)]
+        for key in ("runner_bundle_verified", "xctestrun_verified", "simulator_state_unchanged"):
+            cases.append((dict(good_build, **{key: False}), dict(good_session), True, 1))
+        cases.append((dict(good_build, build_exit=False), dict(good_session), True, 1))
+        cases.append((dict(good_build), dict(good_session), False, 1))
+        for key in ("prebuilt_wda_requested", "prebuilt_wda_verified"):
+            cases.append((dict(good_build), dict(good_session, **{key: False}), True, 1))
+        options = {"derived_data_path": "/private/SENTINEL_PRIVATE_DERIVED"}
+        for build, session, cleanup, failed in cases:
+            events = []
+
+            def host(command, env, callback):
+                events.append("compiled_host_ready")
+                callback("http://127.0.0.1:1234", options)
+                events.append("host_cleanup")
+                return {"wda_build": build, "cleanup_exited": cleanup}
+
+            def prepare():
+                events.append("boot")
+                return "own"
+
+            with self.subTest(build=build, session=session, cleanup=cleanup), \
+                    patch("appium_host_preflight.run_appium_with_prebuilt_owned_server", create=True, side_effect=host), \
+                    patch("appium_host_preflight.run_appium_with_owned_server") as old_host, \
+                    patch("appium_synthetic_ui.run_synthetic_appium_fixture", return_value=session) as client, \
+                    patch.object(probe, "DEADLINE", None):
+                result = probe.appium_session_preflight(None, prepare_device=prepare, prebuild_wda=True)
+                old_host.assert_not_called()
+                client.assert_called_once_with("http://127.0.0.1:1234", "own", mode="session-only", prebuilt_wda=options)
+                self.assertEqual(events, ["compiled_host_ready", "boot", "host_cleanup"])
+                self.assertNotIn("SENTINEL", json.dumps(result))
+                self.assertTrue(result["host_prebuilt_before_device_preparation"])
+                self.assertEqual(result["status"], "APPIUM_SESSION_UNCONFIRMED" if failed else "APPIUM_PREBUILT_SESSION_READY_ONLY")
+
+    def test_prebuilt_build_failure_never_prepares_device_or_creates_session(self):
+        from appium_host_preflight import AppiumHostPreflightError
+        error = AppiumHostPreflightError("HOST_WDA_BUILD", cleanup_exited=True, build_exit=70,
+                                        build_failure_category="destination_not_supported")
+        with patch("appium_host_preflight.run_appium_with_prebuilt_owned_server", create=True, side_effect=error), \
+                patch("appium_synthetic_ui.run_synthetic_appium_fixture") as client, patch.object(probe, "DEADLINE", None):
+            prepare = MagicMock()
+            result = probe.appium_session_preflight(None, prepare_device=prepare, prebuild_wda=True)
+            prepare.assert_not_called()
+            client.assert_not_called()
+            self.assertEqual(result["status"], "HOST_WDA_BUILD")
+            self.assertEqual(result["wda_build_failure"], {"build_exit": 70, "build_failure_category": "destination_not_supported"})
+
+    def test_prebuilt_missing_private_options_never_boots_or_posts(self):
+        for options in (None, {}, {"derived_data_path": None}, {"derived_data_path": ""},
+                        {"derived_data_path": "/private/own", "udid": "other"}):
+            def host(command, env, callback):
+                callback("http://127.0.0.1:1234", options)
+                return {"cleanup_exited": True}
+
+            with self.subTest(options=options), \
+                    patch("appium_host_preflight.run_appium_with_prebuilt_owned_server", create=True, side_effect=host), \
+                    patch("appium_synthetic_ui.run_synthetic_appium_fixture") as client, patch.object(probe, "DEADLINE", None):
+                prepare = MagicMock()
+                result = probe.appium_session_preflight(None, prepare_device=prepare, prebuild_wda=True)
+                prepare.assert_not_called()
+                client.assert_not_called()
+                self.assertEqual(result["session"]["failure_code"], "prebuilt_wda_input_unconfirmed")
+                self.assertEqual(result["status"], "APPIUM_SESSION_UNCONFIRMED")
+
     def test_appium_session_mode_never_uses_native_ui_or_store_reader(self):
         identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
         for status, failure_action, cleanup_failure, expected in (

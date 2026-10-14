@@ -81,6 +81,72 @@ class AppiumSyntheticUiTests(unittest.TestCase):
         self.assertEqual(caps["appium:wdaLaunchTimeout"], 180000)
         self.assertTrue(result["idle0"])
 
+    def test_prebuilt_wda_opt_in_is_requested_verified_and_redacted(self):
+        private_path = "/private/var/folders/PRIVATE_SENTINEL/DerivedData"
+        wire = _Wire(caps={
+            "udid": self.uuid,
+            "bundleId": "com.apple.shortcuts",
+            "automationName": "XCUITest",
+            "waitForIdleTimeout": 0,
+            "usePrebuiltWDA": True,
+            "derivedDataPath": private_path,
+        })
+        with patch("urllib.request.build_opener", return_value=wire):
+            result = subject.run_synthetic_appium_fixture(
+                self.endpoint, self.uuid, prebuilt_wda={"derived_data_path": private_path}
+            )
+        requested = json.loads(wire.calls[0][2])["capabilities"]["alwaysMatch"]
+        self.assertTrue(requested["appium:usePrebuiltWDA"])
+        self.assertEqual(requested["appium:derivedDataPath"], private_path)
+        self.assertTrue(result["prebuilt_wda_requested"])
+        self.assertTrue(result["prebuilt_wda_verified"])
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
+    def test_prebuilt_wda_rejects_malformed_paths_without_requests(self):
+        malformed = (
+            {},
+            {"derived_data_path": "relative/path"},
+            {"derived_data_path": "/private/../escape"},
+            {"derived_data_path": ""},
+            {"derived_data_path": 3},
+            {"derived_data_path": "/private/ok", "extra": True},
+        )
+        for value in malformed:
+            with self.subTest(value=value):
+                wire = _Wire()
+                with patch("urllib.request.build_opener", return_value=wire):
+                    result = subject.run_synthetic_appium_fixture(self.endpoint, self.uuid, prebuilt_wda=value)
+                self.assertEqual(result["failure_code"], "invalid_prebuilt_wda")
+                self.assertFalse(result["prebuilt_wda_requested"])
+                self.assertFalse(result["prebuilt_wda_verified"])
+                self.assertEqual(wire.calls, [])
+
+    def test_prebuilt_wda_effective_capabilities_must_confirm_requested_values(self):
+        private_path = "/private/var/folders/PRIVATE_SENTINEL/DerivedData"
+        base = {
+            "udid": self.uuid,
+            "bundleId": "com.apple.shortcuts",
+            "automationName": "XCUITest",
+            "waitForIdleTimeout": 0,
+        }
+        variants = (
+            base,
+            {**base, "usePrebuiltWDA": True, "derivedDataPath": "/private/other"},
+            {**base, "usePrebuiltWDA": True, "appium:usePrebuiltWDA": False, "derivedDataPath": private_path},
+        )
+        for caps in variants:
+            with self.subTest(caps=caps):
+                wire = _Wire(caps=caps)
+                with patch("urllib.request.build_opener", return_value=wire):
+                    result = subject.run_synthetic_appium_fixture(
+                        self.endpoint, self.uuid, prebuilt_wda={"derived_data_path": private_path}
+                    )
+                self.assertEqual(result["failure_code"], "effective_capabilities_unconfirmed")
+                self.assertTrue(result["prebuilt_wda_requested"])
+                self.assertFalse(result["prebuilt_wda_verified"])
+                self.assertIn(("DELETE", "/session/private-session", None), wire.calls)
+                self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
     def test_uppercase_uuid_is_accepted_but_preserved_in_requested_capability(self):
         wire = _Wire()
         uppercase = self.uuid.upper()
