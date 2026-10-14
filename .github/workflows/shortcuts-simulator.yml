@@ -17,6 +17,7 @@ name: Shortcuts Simulator Inspection
           - appium-session-preflight
           - appium-wda-build-preflight
           - appium-prebuilt-session-preflight
+          - wda-launch-preflight
 
 permissions:
   contents: read

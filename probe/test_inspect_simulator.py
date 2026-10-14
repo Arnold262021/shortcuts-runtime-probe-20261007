@@ -901,6 +901,115 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(probe.choose_device(self.runtimes, self.devices, self.types),
                          ("com.apple.CoreSimulator.SimRuntime.iOS-27-0", "test.iphone"))
 
+    def launch_mode(self, observed, *, preparation_failure=False, budget_low=False, error=None):
+        from appium_host_preflight import AppiumHostPreflightError
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+        seen = []
+
+        def command(args, **kwargs):
+            seen.append(args)
+            if args[1:3] == ["simctl", "boot"] and preparation_failure:
+                raise RuntimeError("SAFE_BOOT_FAILURE")
+            return probe.subprocess.CompletedProcess(args, 0,
+                identifier.encode() if args[1:3] == ["simctl", "create"] else b"", b"")
+
+        def launch(command_wrapper, env, prepare, cleanup):
+            seen.append(["BUILD_BEFORE_BOOT"])
+            if error is not None:
+                cleanup()
+                raise error
+            try:
+                self.assertEqual(prepare(), identifier)
+            except RuntimeError:
+                cleanup()
+                raise AppiumHostPreflightError("HOST_WDA_LAUNCH_DEVICE", cleanup_exited=True) from None
+            seen.append(["WDA_LAUNCH"])
+            cleanup()
+            return observed
+
+        clock = [0, 500] if budget_low else None
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                patch.object(probe.sys, "platform", "darwin"), \
+                patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                           "SHORTCUTS_PROBE_EXECUTION_MODE": "wda-launch-preflight"}), \
+                patch.object(probe, "sim_json", side_effect=[self.runtimes, self.devices, self.types]), \
+                patch.object(probe, "command", side_effect=command), \
+                patch("appium_host_preflight.run_owned_wda_launch_preflight", side_effect=launch), \
+                patch.object(probe, "native_timeout_probe") as timeout, \
+                patch.object(probe, "appium_session_preflight") as session, \
+                patch.object(probe.time, "monotonic", side_effect=clock, return_value=0), patch("builtins.print"):
+            result = probe.main()
+            text = (probe.ARTIFACTS / "receipt.json").read_text()
+            timeout.assert_not_called()
+            session.assert_not_called()
+            self.open_probe.assert_not_called()
+            self.schema_probe.assert_not_called()
+            self.assertNotIn("PRIVATE_SENTINEL", text)
+            self.assertFalse(any("screenshot" in call or "launch" in call for call in seen))
+            return result, json.loads(text), seen
+
+    @staticmethod
+    def ready_wda():
+        return dict(status="WDA_READY_ONLY", ready=True, loopback_verified=True, runner_pid_verified=True,
+                    parent_cleanup_exited=True, simulator_cleanup_confirmed=True, endpoint_closed=True,
+                    temporary_cleanup_confirmed=True, test_launch_attempted=True, status_requests=1,
+                    xctestrun_format=1, wda_build={
+                        "build_exit": 0, "runner_bundle_verified": True, "xctestrun_verified": True,
+                        "simulator_state_unchanged": True})
+
+    def test_wda_launch_requires_every_readiness_cleanup_build_gate(self):
+        good = self.ready_wda()
+        cases = [(good, 0)]
+        for key in ("ready", "loopback_verified", "runner_pid_verified", "parent_cleanup_exited",
+                    "simulator_cleanup_confirmed", "endpoint_closed", "temporary_cleanup_confirmed",
+                    "test_launch_attempted"):
+            cases.append((dict(good, **{key: False}), 1))
+        for key in ("runner_bundle_verified", "xctestrun_verified", "simulator_state_unchanged"):
+            cases.append((dict(good, wda_build=dict(good["wda_build"], **{key: False})), 1))
+        cases += [(dict(good, xctestrun_format=True), 1), (dict(good, status_requests=0), 1),
+                  (dict(good, status_requests=True), 1),
+                  (dict(good, wda_build=dict(good["wda_build"], build_exit=False)), 1)]
+        for observed, expected in cases:
+            with self.subTest(observed=observed):
+                result, receipt, seen = self.launch_mode(observed)
+                self.assertEqual(result, expected)
+                self.assertLess(seen.index(["BUILD_BEFORE_BOOT"]),
+                                next(i for i, item in enumerate(seen) if item[1:3] == ["simctl", "create"]))
+                for action in ("shutdown", "delete"):
+                    self.assertEqual(sum(item[1:3] == ["simctl", action] for item in seen), 1)
+                self.assertFalse(receipt["webdriver_session_created"])
+                self.assertFalse(receipt["appium_server_started"])
+                self.assertFalse(receipt["shortcuts_launched"])
+                self.assertNotIn("xcode_test_suite_run", receipt)
+                self.assertFalse(receipt["native_probe_xcode_test_suite_run"])
+
+    def test_wda_launch_boot_failure_or_low_budget_cleans_once_before_launch(self):
+        for options in ({"preparation_failure": True}, {"budget_low": True}):
+            with self.subTest(options=options):
+                result, receipt, seen = self.launch_mode(self.ready_wda(), **options)
+                self.assertEqual(result, 1)
+                self.assertEqual(receipt["failure"], "HOST_WDA_LAUNCH_DEVICE")
+                self.assertNotIn(["WDA_LAUNCH"], seen)
+                for action in ("shutdown", "delete"):
+                    self.assertEqual(sum(item[1:3] == ["simctl", action] for item in seen), 1)
+
+    def test_wda_launch_error_preserves_only_safe_diagnostic_and_primary(self):
+        from appium_host_preflight import AppiumHostPreflightError
+        error = AppiumHostPreflightError("HOST_WDA_LAUNCH_CLEANUP", cleanup_exited=False,
+            temporary_retained=True, primary_code="HOST_WDA_LAUNCH_OWNERSHIP", wda_launch={
+                "ready": False, "status_requests": 2, "launch_elapsed_ms": "PRIVATE_SENTINEL",
+                "endpoint_url": "PRIVATE_SENTINEL", "xctestrun_format": True,
+                "xctestrun_original_sha256": "a" * 64}, wda_build={
+                "build_exit": 0, "private_paths": {"root": "PRIVATE_SENTINEL"},
+                "wda_package_version": "PRIVATE_SENTINEL"})
+        result, receipt, seen = self.launch_mode({}, error=error)
+        self.assertEqual(result, 1)
+        self.assertEqual(receipt["appium_primary_failure"], "HOST_WDA_LAUNCH_OWNERSHIP")
+        self.assertEqual(receipt["wda_launch"], {"ready": False, "status_requests": 2,
+            "xctestrun_original_sha256": "a" * 64, "wda_build": {"build_exit": 0}})
+        self.assertFalse(any(item[1:3] == ["simctl", "create"] for item in seen))
+
     def test_prebuilt_session_mode_still_never_uses_native_ui_or_store(self):
         identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
         for status, expected in (("APPIUM_PREBUILT_SESSION_READY_ONLY", 0), ("APPIUM_SESSION_READY_ONLY", 1)):

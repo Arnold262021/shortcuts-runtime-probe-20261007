@@ -674,6 +674,41 @@ def wda_failure_diagnostic(error):
     return observed
 
 
+def wda_launch_diagnostic(value):
+    if not isinstance(value, dict):
+        return {}
+    observed = {}
+    for key in ("ready", "loopback_verified", "runner_pid_verified", "parent_cleanup_exited",
+                "simulator_cleanup_confirmed", "endpoint_closed", "temporary_cleanup_confirmed",
+                "test_launch_attempted"):
+        if type(value.get(key)) is bool:
+            observed[key] = value[key]
+    for key in ("status_requests", "launch_elapsed_ms", "xctestrun_format", "parent_exit_after_cleanup"):
+        item = value.get(key)
+        if type(item) is int and (key == "parent_exit_after_cleanup" or item >= 0):
+            observed[key] = item
+    for key in ("xctestrun_original_sha256", "xctestrun_loopback_sha256"):
+        item = value.get(key)
+        if isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item):
+            observed[key] = item
+    build = value.get("wda_build")
+    if isinstance(build, dict):
+        safe_build = {}
+        for key in ("runner_bundle_verified", "xctestrun_verified", "simulator_state_unchanged"):
+            if type(build.get(key)) is bool:
+                safe_build[key] = build[key]
+        for key in ("build_exit", "simulator_device_count"):
+            if type(build.get(key)) is int and (key == "build_exit" or build[key] >= 0):
+                safe_build[key] = build[key]
+        for key in ("xcuitest_version", "wda_package_version"):
+            if isinstance(build.get(key), str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", build[key]):
+                safe_build[key] = build[key]
+        if isinstance(build.get("wda_package_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", build["wda_package_sha256"]):
+            safe_build["wda_package_sha256"] = build["wda_package_sha256"]
+        observed["wda_build"] = safe_build
+    return observed
+
+
 def appium_session_preflight(device_id, *, prepare_device=None, prebuild_wda=False):
     from appium_host_preflight import AppiumHostPreflightError, run_appium_with_owned_server
     from appium_synthetic_ui import run_synthetic_appium_fixture
@@ -748,7 +783,7 @@ def main():
     mode = os.environ.get("SHORTCUTS_PROBE_EXECUTION_MODE", "open-handles")
     if mode not in {"open-handles", "lsof-preflight", "observed-shortcuts-schema",
                     "synthetic-action-shape", "appium-host-preflight", "appium-session-preflight",
-                    "appium-wda-build-preflight", "appium-prebuilt-session-preflight"}:
+                    "appium-wda-build-preflight", "appium-prebuilt-session-preflight", "wda-launch-preflight"}:
         raise RuntimeError("UNKNOWN_PROBE_EXECUTION_MODE")
     ARTIFACTS.mkdir(exist_ok=False)
     TIMINGS.clear()
@@ -804,7 +839,8 @@ def main():
             return 0
         prebuild_wda = mode == "appium-prebuilt-session-preflight"
         session_only = mode in {"appium-session-preflight", "appium-prebuilt-session-preflight"}
-        if not session_only:
+        launch_only = mode == "wda-launch-preflight"
+        if not session_only and not launch_only:
             receipt["native_timeout_probe"] = native_timeout_probe()
             print("PROBE_NATIVE_TIMEOUT=" + json.dumps(receipt["native_timeout_probe"]), flush=True)
             if not receipt["native_timeout_probe"]["wrapper_return_bounded_with_descendant_present"]:
@@ -819,12 +855,16 @@ def main():
             sim_json("list", "runtimes"), sim_json("list", "devices", "available"),
             sim_json("list", "devicetypes"))
         receipt.update(runtime=runtime, device_type=device_type)
-        if session_only:
+        if session_only or launch_only:
             receipt.update(scope="fresh_account_free_session_only", simulator_started=False,
                            xcode_test_suite_run=False, ui_gestures_run=False, page_source_read=False,
                            store_read=False, native_probe_xcode_test_suite_run=False)
             if prebuild_wda:
                 receipt.update(scope="fresh_account_free_prebuilt_requested_session_only", prebuilt_wda_mode=True)
+            if launch_only:
+                receipt.pop("xcode_test_suite_run", None)
+                receipt.update(scope="owned_simulator_wda_launch_only", webdriver_session_created=False,
+                               appium_server_started=False, shortcuts_launched=False)
 
             def prepare_device():
                 nonlocal device_id
@@ -837,7 +877,51 @@ def main():
                 boot_status = command(["xcrun", "simctl", "bootstatus", device_id, "-b"], timeout=300)
                 receipt["bootstatus_exit"] = boot_status.returncode
                 receipt["simulator_started"] = True
+                if launch_only and DEADLINE is not None and DEADLINE - time.monotonic() < 240:
+                    raise RuntimeError("WDA_LAUNCH_BUDGET_EXHAUSTED")
                 return device_id
+
+            if launch_only:
+                from appium_host_preflight import AppiumHostPreflightError, run_owned_wda_launch_preflight
+
+                def cleanup_owned_device():
+                    nonlocal device_id
+                    owned_id, device_id = device_id, None
+                    receipt["cleanup_errors"] = cleanup_device(owned_id) if owned_id is not None else []
+                    return {"cleanup_errors": receipt["cleanup_errors"]}
+
+                try:
+                    observed = run_owned_wda_launch_preflight(command, SAFE_ENV, prepare_device, cleanup_owned_device)
+                except AppiumHostPreflightError as error:
+                    receipt["appium_cleanup_exited"] = error.cleanup_exited
+                    receipt["appium_temporary_retained"] = error.temporary_retained
+                    if error.primary_code is not None:
+                        receipt["appium_primary_failure"] = error.primary_code
+                    diagnostic = wda_launch_diagnostic(error.wda_launch)
+                    build = wda_launch_diagnostic({"wda_build": error.wda_build})
+                    if build:
+                        diagnostic.update(build)
+                    receipt["wda_launch"] = diagnostic
+                    build_diagnostic = wda_failure_diagnostic(error)
+                    if build_diagnostic:
+                        receipt["appium_wda_build_failure"] = build_diagnostic
+                    raise RuntimeError(error.code) from None
+                receipt["wda_launch"] = wda_launch_diagnostic(observed)
+                build = observed.get("wda_build", {}) if isinstance(observed, dict) else {}
+                if (not isinstance(observed, dict) or observed.get("status") != "WDA_READY_ONLY"
+                        or any(observed.get(key) is not True for key in (
+                            "ready", "loopback_verified", "runner_pid_verified", "parent_cleanup_exited",
+                            "simulator_cleanup_confirmed", "endpoint_closed", "temporary_cleanup_confirmed",
+                            "test_launch_attempted"))
+                        or type(observed.get("status_requests")) is not int or observed.get("status_requests") < 1
+                        or type(observed.get("xctestrun_format")) is not int or observed.get("xctestrun_format") != 1
+                        or not isinstance(build, dict) or type(build.get("build_exit")) is not int
+                        or build.get("build_exit") != 0 or any(build.get(key) is not True for key in (
+                            "runner_bundle_verified", "xctestrun_verified", "simulator_state_unchanged"))
+                        or device_id is not None or receipt.get("cleanup_errors") != []):
+                    raise RuntimeError("WDA_LAUNCH_UNCONFIRMED")
+                receipt["status"] = "WDA_READY_ONLY"
+                return 0
 
             observed = (appium_session_preflight(None, prepare_device=prepare_device, prebuild_wda=True)
                         if prebuild_wda else appium_session_preflight(None, prepare_device=prepare_device))

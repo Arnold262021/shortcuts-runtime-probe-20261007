@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import json
+import hashlib
+import io
+import errno
 import os
 from pathlib import Path
 import plistlib
@@ -196,6 +199,160 @@ class AppiumHostPreflightTests(unittest.TestCase):
             self.assertTrue(preflight._cleanup(process))
         self.assertEqual(killpg.call_args_list, [mock.call(1234, preflight.signal.SIGTERM),
                                                 mock.call(1234, 9)])
+
+    def test_wda_cleanup_drains_children_even_after_parent_has_exited(self):
+        process = mock.Mock(pid=1234)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with mock.patch.object(preflight.os, "name", "posix"), \
+                mock.patch.object(preflight.signal, "SIGKILL", 9, create=True), \
+                mock.patch.object(preflight.os, "killpg", side_effect=[None, ProcessLookupError()], create=True) as killpg:
+            self.assertTrue(preflight._cleanup_wda_launch(process))
+        self.assertEqual(killpg.call_args_list, [mock.call(1234, preflight.signal.SIGTERM), mock.call(1234, 0)])
+
+    def test_wda_cleanup_rejects_permanently_live_owned_group(self):
+        process = mock.Mock(pid=1234)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with mock.patch.object(preflight.os, "name", "posix"), \
+                mock.patch.object(preflight.signal, "SIGKILL", 9, create=True), \
+                mock.patch.object(preflight.os, "killpg", return_value=None, create=True) as killpg, \
+                mock.patch.object(preflight.time, "sleep"):
+            self.assertFalse(preflight._cleanup_wda_launch(process))
+        signals = [call.args[1] for call in killpg.call_args_list if call.args[1] != 0]
+        self.assertEqual(signals, [preflight.signal.SIGTERM, 9])
+
+
+class WdaLaunchPreflightTests(unittest.TestCase):
+    uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+    class _Response:
+        status = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def read(self, limit):
+            return self.payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def _launch(self, *, listener=b"p991\nn127.0.0.1:8100\n", command_line=None,
+                cleanup=None, prepare=None, status=b'{"value":{"ready":true}}'):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name) / "appium-host-preflight-wda-launch-test"
+        root.mkdir()
+        package = root / "package"
+        config = package / "WebDriverAgentLib" / "Utilities" / "FBConfiguration.m"
+        config.parent.mkdir(parents=True)
+        config.write_bytes(b"configuration")
+        derived = root / "derived"
+        products = derived / "Build" / "Products"
+        runner = products / "Debug-iphonesimulator" / "WebDriverAgentRunner-Runner.app"
+        runner.mkdir(parents=True)
+        (runner / "Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": "com.facebook.WebDriverAgentRunner.xctrunner",
+            "CFBundleExecutable": "WebDriverAgentRunner-Runner",
+        }))
+        run = products / "Runner.xctestrun"
+        run.write_bytes(plistlib.dumps({"WebDriverAgentRunner": {"EnvironmentVariables": {}}}))
+        container = (root / "CoreSimulator" / "Devices" / self.uuid / "data" / "Containers" /
+                     "Bundle" / "Application" / "PRIVATE_SENTINEL" /
+                     "WebDriverAgentRunner-Runner.app")
+        container.mkdir(parents=True)
+        (container / "WebDriverAgentRunner-Runner").write_bytes(b"runner")
+        if command_line is None:
+            command_line = str(container / "WebDriverAgentRunner-Runner") + " --listen"
+        process = mock.Mock(pid=123)
+        process.poll.return_value = None
+        cleanup = cleanup if cleanup is not None else {"cleanup_errors": []}
+        prepare = prepare if prepare is not None else mock.Mock(return_value=self.uuid)
+        cleanup_device = mock.Mock(return_value=cleanup)
+        responses = [self._Response(status)]
+
+        def run_command(command, args, env, timeout, failure="HOST_PREFLIGHT_NPM_INSTALL"):
+            if args[0] == "lsof":
+                return SimpleNamespace(returncode=0, stdout=listener)
+            if args[:3] == ["xcrun", "simctl", "get_app_container"]:
+                return SimpleNamespace(returncode=0, stdout=str(container).encode())
+            if args[0] == "ps":
+                return SimpleNamespace(returncode=0, stdout=command_line.encode())
+            if args == ["node", "--version"]:
+                return SimpleNamespace(returncode=0, stdout=b"v22.14.0")
+            if args == ["npm", "--version"]:
+                return SimpleNamespace(returncode=0, stdout=b"10.9.2")
+            return SimpleNamespace(returncode=0, stdout=b"3.8.0")
+
+        opener = mock.Mock()
+        opener.open.side_effect = responses
+        expected_config = hashlib.sha256(b"configuration").hexdigest()
+        wda = {"wda_package_version": "16.15.0", "private_paths": {
+            "package_root_path": str(package), "derived_data_path": str(derived),
+        }}
+        with mock.patch.object(preflight.sys, "platform", "darwin"), \
+                mock.patch.dict(preflight.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                mock.patch.object(preflight.tempfile, "mkdtemp", return_value=str(root)), \
+                mock.patch.object(preflight, "_build_owned_wda", return_value=wda), \
+                mock.patch.object(preflight, "_run", side_effect=run_command), \
+                mock.patch.object(preflight, "_free_port", return_value=8100), \
+                mock.patch.object(preflight, "_WDA_CONFIGURATION_SHA256", expected_config), \
+                mock.patch.object(preflight, "build_opener", return_value=opener), \
+                mock.patch.object(preflight.subprocess, "Popen", return_value=process) as popen, \
+                mock.patch.object(preflight, "_cleanup_wda_launch", return_value=True) as stop, \
+                mock.patch.object(preflight, "_wda_endpoint_closed", return_value=True), \
+                mock.patch.object(preflight, "_validated_wda_outputs"), \
+                mock.patch.object(preflight, "_remove_owned_root"):
+            result = preflight.run_owned_wda_launch_preflight(mock.Mock(), {"PATH": os.environ["PATH"]}, prepare, cleanup_device)
+        return result, prepare, cleanup_device, popen, stop, opener
+
+    def test_wda_launch_positive_requires_only_local_wda_readiness(self):
+        result, prepare, cleanup_device, popen, stop, opener = self._launch()
+        self.assertEqual(result["status"], "WDA_READY_ONLY")
+        self.assertTrue(result["loopback_verified"])
+        self.assertTrue(result["runner_pid_verified"])
+        prepare.assert_called_once_with()
+        cleanup_device.assert_called_once_with()
+        stop.assert_called_once_with(popen.return_value)
+        args = popen.call_args.args[0]
+        self.assertEqual(args[:2], ["xcodebuild", "test-without-building"])
+        self.assertFalse(any("session" in str(value).lower() for value in args))
+        self.assertEqual(opener.open.call_count, 1)
+
+    def test_wda_launch_rejects_listener_without_exact_loopback_owner(self):
+        for listener in (b"", b"p991\nn0.0.0.0:8100\n", b"p991\nn[::1]:8100\n",
+                         b"p991\np992\nn127.0.0.1:8100\n"):
+            with self.subTest(listener=listener), self.assertRaises(preflight.AppiumHostPreflightError):
+                with mock.patch.object(preflight.time, "monotonic", side_effect=[0, 0, 181]):
+                    self._launch(listener=listener)
+
+    def test_wda_launch_rejects_wrong_runner_container_without_leaking_it(self):
+        with self.assertRaises(preflight.AppiumHostPreflightError) as caught:
+            with mock.patch.object(preflight.time, "monotonic", side_effect=[0, 0, 181, 181, 181]):
+                self._launch(command_line="/private/other/runner")
+        self.assertNotIn("PRIVATE_SENTINEL", str(caught.exception))
+
+    def test_wda_launch_cleanup_failure_preserves_sanitized_primary(self):
+        with self.assertRaises(preflight.AppiumHostPreflightError) as caught:
+            with mock.patch.object(preflight.time, "monotonic", side_effect=[0, 0, 181, 181, 181]):
+                self._launch(cleanup={"cleanup_errors": ["private"]}, status=b"{}")
+        self.assertEqual(caught.exception.code, "HOST_WDA_LAUNCH_CLEANUP")
+        self.assertIsNotNone(caught.exception.primary_code)
+        self.assertNotIn("private", str(caught.exception))
+
+    def test_wda_endpoint_closed_accepts_only_tcp_connection_refused(self):
+        refused = OSError(errno.ECONNREFUSED, "refused")
+        with mock.patch.object(preflight.socket, "create_connection", side_effect=refused):
+            self.assertTrue(preflight._wda_endpoint_closed(8100))
+        connected = mock.MagicMock()
+        connected.__enter__.return_value = connected
+        with mock.patch.object(preflight.socket, "create_connection", return_value=connected), \
+                mock.patch.object(preflight.time, "sleep"):
+            self.assertFalse(preflight._wda_endpoint_closed(8100))
 
     def _exercise_wda(self, *, changed=False, bad_output=False, bad_install=False,
                       private_version=False, escape=False, build_failure=None, wrong_bundle=False,

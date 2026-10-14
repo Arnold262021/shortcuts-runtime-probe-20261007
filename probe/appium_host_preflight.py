@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import errno
 import os
 from pathlib import Path
 import re
@@ -16,8 +17,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from typing import Callable, Sequence
-from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
+from urllib.error import URLError
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
 APPIUM_VERSION = "3.8.0"
@@ -33,6 +36,8 @@ _ERRORS = frozenset({
     "HOST_PREFLIGHT_CALLBACK_UNCONFIRMED",
     "HOST_WDA_DRIVER_METADATA", "HOST_WDA_RESOLVE", "HOST_WDA_PACKAGE", "HOST_WDA_SIMCTL",
     "HOST_WDA_BUILD", "HOST_WDA_OUTPUT", "HOST_WDA_SIMULATOR_STATE_CHANGED", "HOST_WDA_CLEANUP_UNCONFIRMED",
+    "HOST_WDA_LAUNCH_FORMAT", "HOST_WDA_LAUNCH_CONFIGURATION", "HOST_WDA_LAUNCH_DEVICE", "HOST_WDA_LAUNCH_COMMAND",
+    "HOST_WDA_LAUNCH_READY", "HOST_WDA_LAUNCH_OWNERSHIP", "HOST_WDA_LAUNCH_CLEANUP",
 })
 
 _WDA_RESOLVE_SCRIPT = (
@@ -40,6 +45,7 @@ _WDA_RESOLVE_SCRIPT = (
     "process.stdout.write(JSON.stringify({resolvedPath:p}));"
 )
 _JSON_LIMIT = 64 * 1024
+_WDA_CONFIGURATION_SHA256 = "3461548fb13357211147c87a4299d308e89b35d8b90eaa2f5156a0c3ed3f9bf6"
 
 
 class AppiumHostPreflightError(RuntimeError):
@@ -48,7 +54,7 @@ class AppiumHostPreflightError(RuntimeError):
                  build_exit: int | None = None, build_stdout_bytes: int | None = None,
                  build_stderr_bytes: int | None = None, build_failure_category: str | None = None,
                  build_stdout_sha256: str | None = None, build_stderr_sha256: str | None = None,
-                 wda_build: dict[str, object] | None = None):
+                 wda_build: dict[str, object] | None = None, wda_launch: dict[str, object] | None = None):
         if code not in _ERRORS:
             raise ValueError("unknown appium host preflight code")
         super().__init__(code)
@@ -63,6 +69,7 @@ class AppiumHostPreflightError(RuntimeError):
         self.build_stdout_sha256 = build_stdout_sha256
         self.build_stderr_sha256 = build_stderr_sha256
         self.wda_build = wda_build
+        self.wda_launch = wda_launch
 
 
 def _text(value: object) -> str:
@@ -91,6 +98,242 @@ def _run(command: Callable[..., object], args: Sequence[str], env: dict[str, str
     if getattr(result, "returncode", 1) != 0:
         raise AppiumHostPreflightError(failure)
     return result
+
+
+def _owned_wda_listener(command: Callable[..., object], env: dict[str, str], port: int) -> int:
+    result = _run(command, ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpn"], env, 20,
+                  "HOST_WDA_LAUNCH_OWNERSHIP")
+    pid = None
+    ipv4_seen = False
+    for line in _bounded_cli_text(getattr(result, "stdout", b"")).splitlines():
+        if line.startswith("p"):
+            if re.fullmatch(r"p[0-9]{1,10}", line) is None:
+                raise AppiumHostPreflightError("HOST_WDA_LAUNCH_OWNERSHIP")
+            value = int(line[1:])
+            if value <= 0 or (pid is not None and pid != value):
+                raise AppiumHostPreflightError("HOST_WDA_LAUNCH_OWNERSHIP")
+            pid = value
+        elif line.startswith("n"):
+            if pid is None or line[1:] != f"127.0.0.1:{port}":
+                raise AppiumHostPreflightError("HOST_WDA_LAUNCH_OWNERSHIP")
+            ipv4_seen = ipv4_seen or line[1:] == f"127.0.0.1:{port}"
+        elif line and not line.startswith("f"):
+            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_OWNERSHIP")
+    if pid is None or not ipv4_seen:
+        raise AppiumHostPreflightError("HOST_WDA_LAUNCH_OWNERSHIP")
+    return pid
+
+
+def _bounded_cli_text(raw: object) -> str:
+    try:
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        if not isinstance(raw, bytes) or len(raw) > _JSON_LIMIT:
+            raise ValueError("size")
+        return raw.decode("utf-8")
+    except (ValueError, UnicodeError):
+        raise AppiumHostPreflightError("HOST_WDA_LAUNCH_OWNERSHIP") from None
+
+
+def _wda_runner_owner(command, env, device, bundle, executable, port):
+    pid = _owned_wda_listener(command, env, port)
+    found = _run(command, ["xcrun", "simctl", "get_app_container", device, bundle, "app"], env, 20,
+                 "HOST_WDA_LAUNCH_OWNERSHIP")
+    text = _bounded_cli_text(getattr(found, "stdout", b"")).strip()
+    path = Path(text)
+    if not text or "\n" in text or "\x00" in text or ".." in path.parts or not path.is_absolute():
+        raise AppiumHostPreflightError("HOST_WDA_LAUNCH_OWNERSHIP")
+    try:
+        resolved = path.resolve(strict=True)
+        parts = resolved.parts
+        index = next(i for i, part in enumerate(parts) if part.casefold() == device.casefold())
+        if (parts[index - 2:index] != ("CoreSimulator", "Devices")
+                or parts[index + 1:index + 5] != ("data", "Containers", "Bundle", "Application")
+                or resolved.name != "WebDriverAgentRunner-Runner.app" or not resolved.is_dir()
+                or path.is_symlink() or not (resolved / executable).is_file()):
+            raise ValueError("container")
+    except (OSError, ValueError, StopIteration):
+        raise AppiumHostPreflightError("HOST_WDA_LAUNCH_OWNERSHIP") from None
+    result = _run(command, ["ps", "-ww", "-p", str(pid), "-o", "command="], env, 20,
+                  "HOST_WDA_LAUNCH_OWNERSHIP")
+    arguments = _bounded_cli_text(getattr(result, "stdout", b"")).strip()
+    expected = {str(path / executable), str(resolved / executable)}
+    if not any(arguments == item or arguments.startswith(item + " ") for item in expected):
+        raise AppiumHostPreflightError("HOST_WDA_LAUNCH_OWNERSHIP")
+    if _owned_wda_listener(command, env, port) != pid:
+        raise AppiumHostPreflightError("HOST_WDA_LAUNCH_OWNERSHIP")
+
+
+def _wda_endpoint_closed(port: int) -> bool:
+    for attempt in range(10):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                pass
+        except OSError as error:
+            if error.errno == errno.ECONNREFUSED:
+                return True
+        if attempt < 9:
+            time.sleep(0.5)
+    return False
+
+
+def run_owned_wda_launch_preflight(command: Callable[..., object], safe_env: dict[str, str],
+                                   prepare_device: Callable[[], str], cleanup_device: Callable[[], dict[str, object]]) -> dict[str, object]:
+    """Launch an owned, prebuilt WDA runner and prove only its local readiness."""
+    if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
+        raise AppiumHostPreflightError("HOST_PREFLIGHT_UNSUPPORTED_ENVIRONMENT")
+    if not callable(prepare_device) or not callable(cleanup_device):
+        raise AppiumHostPreflightError("HOST_WDA_LAUNCH_DEVICE")
+    env = {key: value for key, value in safe_env.items() if not key.upper().startswith("NPM_CONFIG_")}
+    root = Path(tempfile.mkdtemp(prefix="appium-host-preflight-wda-launch-"))
+    metadata = root.lstat()
+    identity = (metadata.st_dev, metadata.st_ino)
+    process = None
+    port = None
+    primary = None
+    wda = None
+    observed = {"ready": False, "loopback_verified": False, "runner_pid_verified": False,
+                "parent_cleanup_exited": False, "simulator_cleanup_confirmed": False,
+                "endpoint_closed": False, "temporary_cleanup_confirmed": False,
+                "test_launch_attempted": False, "status_requests": 0}
+    try:
+        npm_prefix = root / "npm"
+        tmp_dir = root / "tmp"
+        tmp_dir.mkdir()
+        for name in ("npmrc", "npm-globalrc"):
+            (root / name).write_text("", encoding="ascii")
+        env.update({"APPIUM_HOME": str(root / "appium-home"), "TMPDIR": str(tmp_dir),
+                    "NPM_CONFIG_USERCONFIG": str(root / "npmrc"), "NPM_CONFIG_GLOBALCONFIG": str(root / "npm-globalrc"),
+                    "NPM_CONFIG_CACHE": str(root / "npm-cache"), "NPM_CONFIG_REGISTRY": _REGISTRY})
+        _version(getattr(_run(command, ["node", "--version"], env, 30, "HOST_PREFLIGHT_NODE_COMMAND"), "stdout", b""), node=True)
+        npm_version = _version(getattr(_run(command, ["npm", "--version"], env, 30, "HOST_PREFLIGHT_NPM_COMMAND"), "stdout", b""))
+        if int(npm_version.split(".")[0]) < 10:
+            raise AppiumHostPreflightError("HOST_PREFLIGHT_NPM_VERSION")
+        _run(command, ["npm", "install", "--prefix", str(npm_prefix), "--no-save", "--registry", _REGISTRY, f"appium@{APPIUM_VERSION}"], env, 180)
+        appium = npm_prefix / "node_modules" / ".bin" / "appium"
+        if _version(getattr(_run(command, [str(appium), "--version"], env, 30, "HOST_PREFLIGHT_CLI_VERSION"), "stdout", b"")) != APPIUM_VERSION:
+            raise AppiumHostPreflightError("HOST_PREFLIGHT_CLI_VERSION")
+        wda = _build_owned_wda(command, appium, env, root)
+        if wda.get("wda_package_version") != "16.15.0":
+            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_CONFIGURATION")
+        package_root = Path(wda["private_paths"]["package_root_path"])
+        config = package_root / "WebDriverAgentLib" / "Utilities" / "FBConfiguration.m"
+        if hashlib.sha256(_read_owned_bounded(config, root, "HOST_WDA_LAUNCH_CONFIGURATION")).hexdigest() != _WDA_CONFIGURATION_SHA256:
+            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_CONFIGURATION")
+        products = Path(wda["private_paths"]["derived_data_path"]) / "Build" / "Products"
+        runs = [path for path in products.iterdir() if path.suffix == ".xctestrun"]
+        if len(runs) != 1:
+            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_FORMAT")
+        original = _read_owned_bounded(runs[0], root, "HOST_WDA_LAUNCH_FORMAT")
+        body = plistlib.loads(original)
+        target = body.get("WebDriverAgentRunner") if isinstance(body, dict) else None
+        version = body.get("__xctestrun_metadata__") if isinstance(body, dict) else None
+        if (not isinstance(target, dict) or "TestConfigurations" in body
+                or ("__xctestrun_metadata__" in body and (not isinstance(version, dict)
+                    or type(version.get("FormatVersion")) is not int or version.get("FormatVersion") != 1))):
+            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_FORMAT")
+        runner = products / "Debug-iphonesimulator" / "WebDriverAgentRunner-Runner.app"
+        runner_info = plistlib.loads(_read_owned_bounded(runner / "Info.plist", root, "HOST_WDA_LAUNCH_FORMAT"))
+        bundle = runner_info.get("CFBundleIdentifier") if isinstance(runner_info, dict) else None
+        executable = runner_info.get("CFBundleExecutable") if isinstance(runner_info, dict) else None
+        if (not isinstance(bundle, str) or re.fullmatch(r"[A-Za-z][A-Za-z0-9.-]{1,254}", bundle) is None
+                or not isinstance(executable, str) or not executable or not executable.isascii()
+                or Path(executable).name != executable or executable in {".", ".."}):
+            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_FORMAT")
+        variables = target.get("EnvironmentVariables", {})
+        if not isinstance(variables, dict) or "USE_IP" in variables or "USE_PORT" in variables:
+            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_FORMAT")
+        port = _free_port()
+        target["EnvironmentVariables"] = dict(variables, USE_IP="127.0.0.1", USE_PORT=str(port))
+        (root / "original.xctestrun.bak").write_bytes(original)
+        modified = plistlib.dumps(body)
+        if len(modified) > _JSON_LIMIT:
+            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_FORMAT")
+        temporary = root / "loopback.xctestrun.tmp"
+        temporary.write_bytes(modified)
+        if not _owned_regular(runs[0], root, directory=False):
+            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_FORMAT")
+        os.replace(temporary, runs[0])
+        if _read_owned_bounded(runs[0], root, "HOST_WDA_LAUNCH_FORMAT") != modified:
+            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_FORMAT")
+        _validated_wda_outputs(products.parent.parent, root)
+        observed.update(xctestrun_format=1, xctestrun_original_sha256=hashlib.sha256(original).hexdigest(),
+                        xctestrun_loopback_sha256=hashlib.sha256(modified).hexdigest())
+        try:
+            device = prepare_device()
+            if not isinstance(device, str) or str(uuid.UUID(device)).casefold() != device.casefold():
+                raise ValueError("device")
+        except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError, TypeError):
+            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_DEVICE") from None
+        opener = build_opener(ProxyHandler({}), _NoRedirect())
+        started = time.monotonic()
+        with (root / "wda.stdout").open("wb") as stdout, (root / "wda.stderr").open("wb") as stderr:
+            try:
+                process = subprocess.Popen(["xcodebuild", "test-without-building", "-xctestrun", str(runs[0]),
+                    "-destination", f"platform=iOS Simulator,id={device}"], stdin=subprocess.DEVNULL,
+                    stdout=stdout, stderr=stderr, env=env, start_new_session=True)
+                observed["test_launch_attempted"] = True
+            except OSError:
+                raise AppiumHostPreflightError("HOST_WDA_LAUNCH_COMMAND") from None
+            deadline = started + 180
+            for attempt in range(180):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or process.poll() is not None:
+                    break
+                try:
+                    with opener.open(Request(f"http://127.0.0.1:{port}/status", method="GET"), timeout=min(3, remaining)) as response:
+                        observed["status_requests"] += 1
+                        raw = response.read(_JSON_LIMIT + 1)
+                        body = _bounded_json(raw, "HOST_WDA_LAUNCH_READY")
+                        value = body.get("value") if isinstance(body, dict) else None
+                        ready = response.status == 200 and isinstance(value, dict) and value.get("ready") is True
+                except (OSError, URLError):
+                    ready = False
+                if ready:
+                    _wda_runner_owner(command, env, device, bundle, executable, port)
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        raise AppiumHostPreflightError("HOST_WDA_LAUNCH_READY")
+                    observed.update(ready=True, loopback_verified=True, runner_pid_verified=True)
+                    break
+                time.sleep(min(1, max(0, deadline - time.monotonic())))
+            observed["launch_elapsed_ms"] = int((time.monotonic() - started) * 1000)
+            if not observed["ready"]:
+                raise AppiumHostPreflightError("HOST_WDA_LAUNCH_READY")
+    except AppiumHostPreflightError as error:
+        primary = error
+    except (OSError, ValueError, TypeError, KeyError, RecursionError, plistlib.InvalidFileException):
+        primary = AppiumHostPreflightError("HOST_WDA_LAUNCH_FORMAT")
+    finally:
+        observed["parent_cleanup_exited"] = _cleanup_wda_launch(process) if process is not None else True
+        if process is not None and type(process.poll()) is int:
+            observed["parent_exit_after_cleanup"] = process.poll()
+        try:
+            cleanup = cleanup_device()
+            observed["simulator_cleanup_confirmed"] = isinstance(cleanup, dict) and cleanup.get("cleanup_errors") == []
+        except Exception:
+            observed["simulator_cleanup_confirmed"] = False
+        if process is not None and port is not None:
+            observed["endpoint_closed"] = _wda_endpoint_closed(port)
+        safe_to_remove = (observed["parent_cleanup_exited"] and observed["simulator_cleanup_confirmed"]
+                          and (process is None or observed["endpoint_closed"]))
+        if safe_to_remove:
+            try:
+                _remove_owned_root(root, identity)
+                observed["temporary_cleanup_confirmed"] = True
+            except (OSError, AppiumHostPreflightError):
+                pass
+    cleanup_ok = (observed["parent_cleanup_exited"] and observed["simulator_cleanup_confirmed"]
+                  and observed["temporary_cleanup_confirmed"] and (process is None or observed["endpoint_closed"]))
+    if not cleanup_ok:
+        raise AppiumHostPreflightError("HOST_WDA_LAUNCH_CLEANUP", cleanup_exited=False,
+            temporary_retained=not observed["temporary_cleanup_confirmed"], primary_code=primary.code if primary else None,
+            wda_build=_safe_wda_build(wda), wda_launch=observed) from None
+    if primary is not None:
+        raise AppiumHostPreflightError(primary.code, cleanup_exited=True, wda_build=_safe_wda_build(wda),
+            wda_launch=observed, build_exit=primary.build_exit, build_stdout_bytes=primary.build_stdout_bytes,
+            build_stderr_bytes=primary.build_stderr_bytes, build_failure_category=primary.build_failure_category,
+            build_stdout_sha256=primary.build_stdout_sha256, build_stderr_sha256=primary.build_stderr_sha256) from None
+    return dict(observed, status="WDA_READY_ONLY", wda_build=_safe_wda_build(wda))
 
 
 def _build_failure(result: object) -> AppiumHostPreflightError:
@@ -156,6 +399,39 @@ def _cleanup(process: subprocess.Popen[bytes]) -> bool:
             return True
         except (OSError, subprocess.TimeoutExpired):
             return False
+
+
+def _cleanup_wda_launch(process: subprocess.Popen[bytes]) -> bool:
+    if os.name != "posix":
+        return _cleanup(process)
+
+    def group_gone(attempts):
+        for attempt in range(attempts):
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return True
+            except OSError:
+                return False
+            if attempt + 1 < attempts:
+                time.sleep(0.1)
+        return False
+
+    # A completed parent can still have children in its owned process group.
+    for sig, timeout, attempts in ((signal.SIGTERM, 5, 50), (signal.SIGKILL, 3, 30)):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return False
+        try:
+            process.wait(timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if process.poll() is not None and group_gone(attempts):
+            return True
+    return False
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -442,7 +718,7 @@ def _build_owned_wda(command: Callable[..., object], appium: Path, env: dict[str
         "wda_package_sha256": package_sha256, "build_exit": 0,
         "runner_bundle_verified": True, "xctestrun_verified": True,
         "simulator_state_unchanged": True, "simulator_device_count": len(after_states),
-        "private_paths": {"derived_data_path": str(derived)},
+        "private_paths": {"derived_data_path": str(derived), "package_root_path": str(package_root)},
     }
 
 
@@ -577,7 +853,7 @@ def _run_owned_server(command: Callable[..., object], safe_env: dict[str, str],
                         private_paths = wda_result["private_paths"] if wda_result is not None else None
                         if not isinstance(private_paths, dict):
                             raise ValueError("prebuilt paths")
-                        on_ready(f"http://127.0.0.1:{port}", private_paths)
+                        on_ready(f"http://127.0.0.1:{port}", {"derived_data_path": private_paths["derived_data_path"]})
                     else:
                         on_ready(f"http://127.0.0.1:{port}")
                 except Exception:
