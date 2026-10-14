@@ -45,6 +45,12 @@ final class ShortcutsObservationTests: XCTestCase {
             stage: "shortcut-actions-menu"
         ) else { return }
         print("PROBE_ACTIONS_MENU_OBSERVED=true")
+        guard tapUnique(
+            shortcuts.collectionViews.buttons.matching(NSPredicate(format: "label == %@", "Share")),
+            in: shortcuts,
+            stage: "shortcut-share-options"
+        ) else { return }
+        print("PROBE_SHARE_OPTIONS_OBSERVED=true")
         print("PROBE_NO_RUN_SAVE_EXPORT_OR_NETWORK_ATTEMPTED=true")
     }
 
