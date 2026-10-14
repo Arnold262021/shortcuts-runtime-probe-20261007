@@ -1056,6 +1056,46 @@ class SelectionTests(unittest.TestCase):
             "xctestrun_original_sha256": "a" * 64, "wda_build": {"build_exit": 0}})
         self.assertFalse(any(item[1:3] == ["simctl", "create"] for item in seen))
 
+    def test_wda_launch_diagnostic_filters_outcomes_and_owned_stream_metadata(self):
+        names = ("connection_refused", "connection_timeout", "connection_other", "http_non200",
+                 "http_nonready", "http_ready", "invalid_response", "response_timeout", "response_io_error")
+        counts = dict.fromkeys(names, 0)
+        counts.update(connection_refused=1, connection_timeout=2, http_nonready=3)
+        good = dict(status_requests=6, status_outcomes=dict(counts, PRIVATE_SENTINEL="PRIVATE_SENTINEL"),
+                    parent_state_before_cleanup="exited", parent_exit_before_cleanup=65,
+                    launch_streams={"stdout": dict(state="measured", bytes=100, sha256="a" * 64,
+                        server_url_marker_pairs=1, text="PRIVATE_SENTINEL", path="PRIVATE_SENTINEL"),
+                        "stderr": dict(state="writers_unconfirmed", bytes=10, text="PRIVATE_SENTINEL"),
+                        "PRIVATE_SENTINEL": {"state": "measured"}})
+        actual = probe.wda_launch_diagnostic(good)
+        self.assertEqual(actual["status_outcomes"], counts)
+        self.assertEqual(actual["parent_exit_before_cleanup"], 65)
+        self.assertEqual(actual["launch_streams"], {"stdout": dict(state="measured", bytes=100,
+            sha256="a" * 64, server_url_marker_pairs=1), "stderr": {"state": "writers_unconfirmed"}})
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(actual))
+        for bad in (dict(counts, connection_refused=True), dict(counts, connection_refused=-1),
+                    dict(counts, connection_refused=181), dict(counts, connection_refused="PRIVATE_SENTINEL"),
+                    {key: value for key, value in counts.items() if key != "http_ready"}):
+            with self.subTest(bad=bad):
+                self.assertNotIn("status_outcomes", probe.wda_launch_diagnostic(dict(good, status_outcomes=bad)))
+        self.assertNotIn("status_outcomes", probe.wda_launch_diagnostic(dict(good, status_requests=5)))
+        excess = dict.fromkeys(names, 0)
+        excess.update(connection_refused=180, connection_timeout=1)
+        self.assertNotIn("status_outcomes", probe.wda_launch_diagnostic(dict(good, status_requests=181, status_outcomes=excess)))
+        self.assertNotIn("status_requests", probe.wda_launch_diagnostic({"status_requests": 181}))
+        self.assertNotIn("parent_exit_before_cleanup", probe.wda_launch_diagnostic(dict(good, parent_exit_before_cleanup=True)))
+        self.assertNotIn("parent_state_before_cleanup", probe.wda_launch_diagnostic(dict(good, parent_state_before_cleanup="PRIVATE_SENTINEL")))
+
+    def test_wda_launch_diagnostic_rejects_invalid_stream_fields_without_raw_values(self):
+        valid = dict(state="measured", bytes=100, sha256="b" * 64, server_url_marker_pairs=0)
+        for invalid in (dict(valid, bytes=True), dict(valid, bytes=-1), dict(valid, bytes=1024 * 1024 + 1),
+                        dict(valid, sha256="PRIVATE_SENTINEL"), dict(valid, server_url_marker_pairs=True),
+                        dict(valid, server_url_marker_pairs=101), dict(valid, state="PRIVATE_SENTINEL")):
+            with self.subTest(invalid=invalid):
+                actual = probe.wda_launch_diagnostic({"launch_streams": {"stdout": invalid}})
+                self.assertEqual(actual["launch_streams"], {})
+                self.assertNotIn("PRIVATE_SENTINEL", json.dumps(actual))
+
     def test_prebuilt_session_mode_still_never_uses_native_ui_or_store(self):
         identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
         for status, expected in (("APPIUM_PREBUILT_SESSION_READY_ONLY", 0), ("APPIUM_SESSION_READY_ONLY", 1)):

@@ -19,7 +19,7 @@ import tempfile
 import time
 import uuid
 from typing import Callable, Sequence
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
@@ -46,6 +46,71 @@ _WDA_RESOLVE_SCRIPT = (
 )
 _JSON_LIMIT = 64 * 1024
 _WDA_CONFIGURATION_SHA256 = "3461548fb13357211147c87a4299d308e89b35d8b90eaa2f5156a0c3ed3f9bf6"
+_WDA_STREAM_LIMIT = 1024 * 1024
+_WDA_STATUS_OUTCOMES = (
+    "connection_refused", "connection_timeout", "connection_other", "http_non200",
+    "http_nonready", "http_ready", "invalid_response", "response_timeout", "response_io_error",
+)
+
+
+def _wda_status_exception(error: BaseException, response_opened: bool = False) -> str:
+    if isinstance(error, HTTPError):
+        return "http_non200"
+    reason = error.reason if isinstance(error, URLError) else error
+    timed_out = isinstance(reason, TimeoutError) or (isinstance(reason, OSError) and reason.errno == errno.ETIMEDOUT)
+    if response_opened:
+        return "response_timeout" if timed_out else "response_io_error"
+    if timed_out:
+        return "connection_timeout"
+    if isinstance(reason, OSError) and reason.errno == errno.ECONNREFUSED:
+        return "connection_refused"
+    return "connection_other"
+
+
+def _owned_launch_stream_metadata(root: Path, filename: str, identity: tuple[int, int]) -> dict[str, object]:
+    """Only hashes and fixed marker counts survive the owned launch log cleanup."""
+    if filename not in {"wda.stdout", "wda.stderr"}:
+        return {"state": "unavailable"}
+    path = root / filename
+    try:
+        root_stat = root.lstat()
+        if root.is_symlink() or (root_stat.st_dev, root_stat.st_ino) != identity:
+            return {"state": "unstable"}
+        if not _owned_regular(path, root, directory=False):
+            return {"state": "unavailable"}
+        initial = path.lstat()
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or (before.st_dev, before.st_ino) != (initial.st_dev, initial.st_ino):
+                return {"state": "unstable"}
+            if before.st_size > _WDA_STREAM_LIMIT:
+                return {"state": "over_limit"}
+            raw = bytearray()
+            while len(raw) <= _WDA_STREAM_LIMIT:
+                block = os.read(descriptor, min(65536, _WDA_STREAM_LIMIT + 1 - len(raw)))
+                if not block:
+                    break
+                raw.extend(block)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        final = path.lstat()
+        final_root = root.lstat()
+        snapshot = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        if (snapshot(before) != snapshot(after) or snapshot(after) != snapshot(final)
+                or len(raw) != after.st_size or root.is_symlink() or path.is_symlink()
+                or (final_root.st_dev, final_root.st_ino) != identity):
+            return {"state": "unstable"}
+        if len(raw) > _WDA_STREAM_LIMIT:
+            return {"state": "over_limit"}
+        begin, end = b"ServerURLHere->", b"<-ServerURLHere"
+        pairs = sum(line.find(end, index + len(begin)) >= 0
+                    for line in raw.splitlines() if (index := line.find(begin)) >= 0)
+        return {"state": "measured", "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                "server_url_marker_pairs": pairs}
+    except OSError:
+        return {"state": "unavailable"}
 
 
 class AppiumHostPreflightError(RuntimeError):
@@ -195,7 +260,8 @@ def run_owned_wda_launch_preflight(command: Callable[..., object], safe_env: dic
     observed = {"ready": False, "loopback_verified": False, "runner_pid_verified": False,
                 "parent_cleanup_exited": False, "simulator_cleanup_confirmed": False,
                 "endpoint_closed": False, "temporary_cleanup_confirmed": False,
-                "test_launch_attempted": False, "status_requests": 0}
+                "test_launch_attempted": False, "status_requests": 0,
+                "status_outcomes": dict.fromkeys(_WDA_STATUS_OUTCOMES, 0)}
     try:
         npm_prefix = root / "npm"
         tmp_dir = root / "tmp"
@@ -280,15 +346,33 @@ def run_owned_wda_launch_preflight(command: Callable[..., object], safe_env: dic
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or process.poll() is not None:
                     break
+                response_opened = False
+                ready = False
                 try:
                     observed["status_requests"] += 1
                     with opener.open(Request(f"http://127.0.0.1:{port}/status", method="GET"), timeout=min(3, remaining)) as response:
-                        raw = response.read(_JSON_LIMIT + 1)
-                        body = _bounded_json(raw, "HOST_WDA_LAUNCH_READY")
-                        value = body.get("value") if isinstance(body, dict) else None
-                        ready = response.status == 200 and isinstance(value, dict) and value.get("ready") is True
-                except (OSError, URLError):
-                    ready = False
+                        response_opened = True
+                        if type(response.status) is not int:
+                            raise AppiumHostPreflightError("HOST_WDA_LAUNCH_READY")
+                        if response.status != 200:
+                            outcome = "http_non200"
+                        else:
+                            raw = response.read(_JSON_LIMIT + 1)
+                            body = _bounded_json(raw, "HOST_WDA_LAUNCH_READY")
+                            value = body.get("value") if isinstance(body, dict) else None
+                            ready = isinstance(value, dict) and value.get("ready") is True
+                            outcome = "http_ready" if ready else "http_nonready"
+                except (OSError, URLError) as error:
+                    outcome = _wda_status_exception(error, response_opened)
+                    if isinstance(error, HTTPError):
+                        try:
+                            error.close()
+                        except OSError:
+                            pass
+                except AppiumHostPreflightError:
+                    observed["status_outcomes"]["invalid_response"] += 1
+                    raise
+                observed["status_outcomes"][outcome] += 1
                 if ready:
                     _wda_runner_owner(command, env, device, bundle, executable, port)
                     if process.poll() is not None or time.monotonic() >= deadline:
@@ -304,9 +388,31 @@ def run_owned_wda_launch_preflight(command: Callable[..., object], safe_env: dic
     except (OSError, ValueError, TypeError, KeyError, RecursionError, plistlib.InvalidFileException):
         primary = AppiumHostPreflightError("HOST_WDA_LAUNCH_FORMAT")
     finally:
+        try:
+            parent_exit = process.poll() if process is not None else None
+            observed["parent_state_before_cleanup"] = ("not_launched" if process is None else
+                "running" if parent_exit is None else "exited" if type(parent_exit) is int else "unconfirmed")
+            if type(parent_exit) is int:
+                observed["parent_exit_before_cleanup"] = parent_exit
+        except Exception:
+            observed["parent_state_before_cleanup"] = "unconfirmed"
         observed["parent_cleanup_exited"] = _cleanup_wda_launch(process) if process is not None else True
-        if process is not None and type(process.poll()) is int:
-            observed["parent_exit_after_cleanup"] = process.poll()
+        if process is not None:
+            try:
+                after_cleanup = process.poll()
+                if type(after_cleanup) is int:
+                    observed["parent_exit_after_cleanup"] = after_cleanup
+            except Exception:
+                pass
+        observed["launch_streams"] = {}
+        for name in ("stdout", "stderr"):
+            stream = {"state": "not_launched" if process is None else "writers_unconfirmed"}
+            if process is not None and observed["parent_cleanup_exited"]:
+                try:
+                    stream = _owned_launch_stream_metadata(root, "wda." + name, identity)
+                except Exception:
+                    stream = {"state": "unavailable"}
+            observed["launch_streams"][name] = stream
         try:
             cleanup = cleanup_device()
             observed["simulator_cleanup_confirmed"] = isinstance(cleanup, dict) and cleanup.get("cleanup_errors") == []

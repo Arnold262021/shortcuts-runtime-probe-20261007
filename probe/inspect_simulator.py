@@ -728,10 +728,43 @@ def wda_launch_diagnostic(value):
                 "test_launch_attempted"):
         if type(value.get(key)) is bool:
             observed[key] = value[key]
-    for key in ("status_requests", "launch_elapsed_ms", "xctestrun_format", "parent_exit_after_cleanup"):
+    for key in ("status_requests", "launch_elapsed_ms", "xctestrun_format", "parent_exit_after_cleanup",
+                "parent_exit_before_cleanup"):
         item = value.get(key)
-        if type(item) is int and (key == "parent_exit_after_cleanup" or item >= 0):
+        if (type(item) is int and (key in {"parent_exit_after_cleanup", "parent_exit_before_cleanup"} or item >= 0)
+                and (key != "status_requests" or item <= 180)):
             observed[key] = item
+    parent = value.get("parent_state_before_cleanup")
+    if isinstance(parent, str) and parent in {"not_launched", "running", "exited", "unconfirmed"}:
+        observed["parent_state_before_cleanup"] = parent
+    counts = value.get("status_outcomes")
+    names = ("connection_refused", "connection_timeout", "connection_other", "http_non200",
+             "http_nonready", "http_ready", "invalid_response", "response_timeout", "response_io_error")
+    if (isinstance(counts, dict) and all(type(counts.get(key)) is int and 0 <= counts[key] <= 180 for key in names)
+            and type(value.get("status_requests")) is int and 0 <= value["status_requests"] <= 180
+            and sum(counts[key] for key in names) == value["status_requests"]):
+        observed["status_outcomes"] = {key: counts[key] for key in names}
+    streams = value.get("launch_streams")
+    if isinstance(streams, dict):
+        safe_streams = {}
+        for name in ("stdout", "stderr"):
+            item = streams.get(name)
+            if not isinstance(item, dict):
+                continue
+            state = item.get("state")
+            if not isinstance(state, str) or state not in {"measured", "unavailable", "over_limit", "unstable",
+                                                          "writers_unconfirmed", "not_launched"}:
+                continue
+            safe = {"state": state}
+            if state == "measured":
+                size, pairs, digest = item.get("bytes"), item.get("server_url_marker_pairs"), item.get("sha256")
+                if (type(size) is not int or not 0 <= size <= 1024 * 1024 or type(pairs) is not int
+                        or not 0 <= pairs <= size or not isinstance(digest, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+                    continue
+                safe.update(bytes=size, sha256=digest, server_url_marker_pairs=pairs)
+            safe_streams[name] = safe
+        observed["launch_streams"] = safe_streams
     for key in ("xctestrun_original_sha256", "xctestrun_loopback_sha256"):
         item = value.get(key)
         if isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item):

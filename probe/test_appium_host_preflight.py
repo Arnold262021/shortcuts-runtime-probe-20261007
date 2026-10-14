@@ -229,8 +229,9 @@ class WdaLaunchPreflightTests(unittest.TestCase):
     class _Response:
         status = 200
 
-        def __init__(self, payload):
+        def __init__(self, payload, status=200):
             self.payload = payload
+            self.status = status
 
         def read(self, limit):
             return self.payload
@@ -243,7 +244,8 @@ class WdaLaunchPreflightTests(unittest.TestCase):
 
     def _launch(self, *, listener=b"p991\nn127.0.0.1:8100\n", command_line=None,
                 cleanup=None, prepare=None, status=b'{"value":{"ready":true}}',
-                variables=None, status_errors=(), module=preflight):
+                variables=None, status_errors=(), responses=None, logbytes=(b"", b""),
+                parent_cleanup=True, poll_side_effect=None, module=preflight):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name) / "appium-host-preflight-wda-launch-test"
@@ -272,11 +274,14 @@ class WdaLaunchPreflightTests(unittest.TestCase):
         if command_line is None:
             command_line = str(container / "WebDriverAgentRunner-Runner") + " --listen"
         process = mock.Mock(pid=123)
-        process.poll.return_value = None
+        if poll_side_effect is None:
+            process.poll.return_value = None
+        else:
+            process.poll.side_effect = poll_side_effect
         cleanup = cleanup if cleanup is not None else {"cleanup_errors": []}
         prepare = prepare if prepare is not None else mock.Mock(return_value=self.uuid)
         cleanup_device = mock.Mock(return_value=cleanup)
-        responses = [*status_errors, self._Response(status)]
+        responses = [*status_errors, self._Response(status)] if responses is None else list(responses)
 
         def run_command(command, args, env, timeout, failure="HOST_PREFLIGHT_NPM_INSTALL"):
             if args[0] == "lsof":
@@ -293,6 +298,12 @@ class WdaLaunchPreflightTests(unittest.TestCase):
 
         opener = mock.Mock()
         opener.open.side_effect = responses
+        def start(*args, **kwargs):
+            kwargs["stdout"].write(logbytes[0])
+            kwargs["stderr"].write(logbytes[1])
+            kwargs["stdout"].flush()
+            kwargs["stderr"].flush()
+            return process
         expected_config = hashlib.sha256(b"configuration").hexdigest()
         wda = {"wda_package_version": "16.15.0", "private_paths": {
             "package_root_path": str(package), "derived_data_path": str(derived),
@@ -306,14 +317,16 @@ class WdaLaunchPreflightTests(unittest.TestCase):
                 mock.patch.object(module, "_free_port", return_value=8100), \
                 mock.patch.object(module, "_WDA_CONFIGURATION_SHA256", expected_config), \
                 mock.patch.object(module, "build_opener", return_value=opener), \
-                mock.patch.object(module.subprocess, "Popen", return_value=process) as popen, \
-                mock.patch.object(module, cleanup_name, return_value=True) as stop, \
+                mock.patch.object(module.subprocess, "Popen", side_effect=start) as popen, \
+                mock.patch.object(module, cleanup_name, return_value=parent_cleanup) as stop, \
                 mock.patch.object(module.time, "sleep") as sleep, \
-                mock.patch.object(module, "_wda_endpoint_closed", return_value=True), \
+                mock.patch.object(module, "_wda_endpoint_closed", return_value=True) as endpoint_closed, \
                 mock.patch.object(module, "_validated_wda_outputs"), \
-                mock.patch.object(module, "_remove_owned_root"):
+                mock.patch.object(module, "_remove_owned_root") as remove_root:
+            popen.return_value = process
             self._launch_observed = SimpleNamespace(root=root, run=run, original=original_run,
-                                                     prepare=prepare, popen=popen, sleep=sleep)
+                                                     prepare=prepare, popen=popen, sleep=sleep,
+                                                     endpoint_closed=endpoint_closed, remove_root=remove_root)
             result = module.run_owned_wda_launch_preflight(mock.Mock(), {"PATH": os.environ["PATH"]}, prepare, cleanup_device)
         return result, prepare, cleanup_device, popen, stop, opener
 
@@ -346,6 +359,114 @@ class WdaLaunchPreflightTests(unittest.TestCase):
         cleanup_device.assert_called_once_with()
         stop.assert_called_once_with(popen.return_value)
         self.assertNotIn("PRIVATE", str(result))
+
+    def test_wda_status_outcomes_are_fixed_counted_and_message_free(self):
+        self.assertEqual(preflight._WDA_STATUS_OUTCOMES, (
+            "connection_refused", "connection_timeout", "connection_other", "http_non200",
+            "http_nonready", "http_ready", "invalid_response", "response_timeout", "response_io_error",
+        ))
+        self.assertEqual(preflight._wda_status_exception(
+            preflight.URLError(OSError(errno.ECONNREFUSED, "REFUSED_PRIVATE"))), "connection_refused")
+        self.assertEqual(preflight._wda_status_exception(TimeoutError("TIMEOUT_PRIVATE")), "connection_timeout")
+        self.assertEqual(preflight._wda_status_exception(OSError(errno.EIO, "IO_PRIVATE"), True), "response_io_error")
+        self.assertEqual(preflight._wda_status_exception(TimeoutError("READ_PRIVATE"), True), "response_timeout")
+        self.assertEqual(preflight._wda_status_exception(
+            preflight.HTTPError("http://PRIVATE", 503, "PRIVATE", {}, None)), "http_non200")
+
+        responses = (
+            self._Response(b"ignored", 503),
+            self._Response(b'{"value":{"ready":false}}'),
+            self._Response(b'{"value":{"ready":true}}'),
+        )
+        result, _, _, popen, _, opener = self._launch(responses=responses)
+        outcomes = result["status_outcomes"]
+        self.assertEqual(outcomes["http_non200"], 1)
+        self.assertEqual(outcomes["http_nonready"], 1)
+        self.assertEqual(outcomes["http_ready"], 1)
+        self.assertEqual(sum(outcomes.values()), result["status_requests"])
+        self.assertEqual(opener.open.call_count, 3)
+        self.assertTrue(all(call.args[0].get_method() == "GET" for call in opener.open.call_args_list))
+        popen.assert_called_once()
+        self.assertNotIn("PRIVATE", str(result))
+
+    def test_wda_invalid_response_preserves_primary_with_counted_safe_outcome(self):
+        with self.assertRaises(preflight.AppiumHostPreflightError) as caught:
+            self._launch(status=b"PRIVATE_NOT_JSON")
+        self.assertEqual(caught.exception.code, "HOST_WDA_LAUNCH_READY")
+        observed = caught.exception.wda_launch
+        self.assertEqual(observed["status_requests"], 1)
+        self.assertEqual(observed["status_outcomes"]["invalid_response"], 1)
+        self.assertEqual(sum(observed["status_outcomes"].values()), 1)
+        self.assertNotIn("PRIVATE", str(caught.exception))
+
+    def test_wda_launch_post_cleanup_poll_error_keeps_cleanup_and_privacy(self):
+        result, prepare, cleanup_device, popen, stop, _ = self._launch(
+            poll_side_effect=(None, None, None, RuntimeError("POLL_PRIVATE")))
+        self.assertEqual(result["status"], "WDA_READY_ONLY")
+        self.assertEqual(result["parent_state_before_cleanup"], "running")
+        self.assertNotIn("parent_exit_before_cleanup", result)
+        self.assertNotIn("parent_exit_after_cleanup", result)
+        self.assertNotIn("POLL_PRIVATE", str(result))
+        prepare.assert_called_once_with()
+        cleanup_device.assert_called_once_with()
+        stop.assert_called_once_with(popen.return_value)
+        self._launch_observed.endpoint_closed.assert_called_once_with(8100)
+        self._launch_observed.remove_root.assert_called_once()
+
+    def test_wda_launch_stream_metadata_error_keeps_all_cleanup(self):
+        with mock.patch.object(preflight, "_owned_launch_stream_metadata",
+                               side_effect=RuntimeError("STREAM_PRIVATE")):
+            result, prepare, cleanup_device, popen, stop, _ = self._launch()
+        self.assertEqual(result["launch_streams"], {
+            "stdout": {"state": "unavailable"},
+            "stderr": {"state": "unavailable"},
+        })
+        self.assertNotIn("STREAM_PRIVATE", str(result))
+        prepare.assert_called_once_with()
+        cleanup_device.assert_called_once_with()
+        stop.assert_called_once_with(popen.return_value)
+        self._launch_observed.endpoint_closed.assert_called_once_with(8100)
+        self._launch_observed.remove_root.assert_called_once()
+
+    def test_owned_launch_stream_metadata_is_bounded_and_private(self):
+        with tempfile.TemporaryDirectory(prefix="appium-host-preflight-") as directory:
+            root = Path(directory)
+            identity = (root.lstat().st_dev, root.lstat().st_ino)
+            stdout = root / "wda.stdout"
+            stdout.write_bytes(b"PRIVATE ServerURLHere->opaque<-ServerURLHere\nServerURLHere->x\n")
+            measured = preflight._owned_launch_stream_metadata(root, "wda.stdout", identity)
+            self.assertEqual(measured["state"], "measured")
+            self.assertEqual(measured["bytes"], stdout.stat().st_size)
+            self.assertEqual(measured["server_url_marker_pairs"], 1)
+            self.assertRegex(measured["sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(set(measured), {"state", "bytes", "sha256", "server_url_marker_pairs"})
+            self.assertNotIn("PRIVATE", str(measured))
+            self.assertEqual(preflight._owned_launch_stream_metadata(root, "other.log", identity), {"state": "unavailable"})
+            self.assertEqual(preflight._owned_launch_stream_metadata(root, "wda.stdout", (0, 0)), {"state": "unstable"})
+            stdout.write_bytes(b"x" * (preflight._WDA_STREAM_LIMIT + 1))
+            self.assertEqual(preflight._owned_launch_stream_metadata(root, "wda.stdout", identity), {"state": "over_limit"})
+
+    def test_wda_launch_streams_are_measured_only_after_parent_cleanup(self):
+        measured = {"state": "measured", "bytes": 0, "sha256": "0" * 64,
+                    "server_url_marker_pairs": 0}
+        with mock.patch.object(preflight, "_owned_launch_stream_metadata", return_value=measured) as metadata:
+            result, _, _, _, _, _ = self._launch()
+        streams = result["launch_streams"]
+        self.assertEqual(streams["stdout"]["state"], "measured")
+        self.assertEqual(streams["stdout"]["server_url_marker_pairs"], 0)
+        self.assertEqual(streams["stderr"]["state"], "measured")
+        self.assertEqual(metadata.call_count, 2)
+        self.assertNotIn("PRIVATE", str(streams))
+
+        with self.assertRaises(preflight.AppiumHostPreflightError) as caught:
+            self._launch(logbytes=(b"PRIVATE", b"PRIVATE"), parent_cleanup=False)
+        self.assertEqual(caught.exception.code, "HOST_WDA_LAUNCH_CLEANUP")
+        streams = caught.exception.wda_launch["launch_streams"]
+        self.assertEqual(streams, {
+            "stdout": {"state": "writers_unconfirmed"},
+            "stderr": {"state": "writers_unconfirmed"},
+        })
+        self.assertNotIn("PRIVATE", str(caught.exception))
 
     def test_wda_launch_replaces_only_owned_bindings(self):
         variables = {
