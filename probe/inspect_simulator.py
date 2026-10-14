@@ -416,6 +416,52 @@ def collect_native_entitlement_metadata(device_id):
         return {"status": "NATIVE_BUNDLE_METADATA_UNCONFIRMED", "system_store_read": False}
 
 
+def collect_native_open_files(device_id):
+    from native_open_files import NativeOpenFilesError, parse_simctl_launch, parse_lsof_metadata
+
+    closed = {"open_handle_contents_read": False, "database_copy": False,
+              "condition_payload_proven": False}
+    try:
+        device_root = Path.home() / "Library/Developer/CoreSimulator/Devices" / device_id
+        own_data = device_root / "data"
+        if device_root.is_symlink() or own_data.is_symlink() or not own_data.is_dir():
+            return {**closed, "status": "OPEN_HANDLE_OWN_DATA_UNCONFIRMED"}
+        bundle_result = command(["xcrun", "simctl", "get_app_container", device_id,
+                                 "com.apple.shortcuts", "app"], timeout=15, check=False)
+        if bundle_result.returncode:
+            return {**closed, "status": "OPEN_HANDLE_BUNDLE_UNCONFIRMED"}
+        verify_native_shortcuts_bundle(bundle_result.stdout)
+        launch_args = ["xcrun", "simctl", "launch", device_id, "com.apple.shortcuts"]
+        first = command(launch_args, timeout=15, check=False)
+        if first.returncode:
+            return {**closed, "status": "OPEN_HANDLE_LAUNCH_UNCONFIRMED"}
+        pid = parse_simctl_launch(first.stdout)
+        opened = command(["lsof", "-nP", "-a", "-p", str(pid), "-Fpcn"],
+                         timeout=10, check=False)
+        if opened.returncode:
+            return {**closed, "status": "OPEN_HANDLE_COMMAND_UNCONFIRMED"}
+        last = command(launch_args, timeout=15, check=False)
+        if last.returncode or parse_simctl_launch(last.stdout) != pid:
+            return {**closed, "status": "OPEN_HANDLE_PID_UNSTABLE"}
+        try:
+            parsed = parse_lsof_metadata(opened.stdout, pid, own_data)
+            metadata = {"status": "OPEN_HANDLE_PATH_METADATA_OBSERVED",
+                        "paths": parsed["open_paths"]}
+        except NativeOpenFilesError as error:
+            if str(error) != "NO_ASSOCIATED_OPEN_HANDLE_OBSERVED":
+                raise
+            metadata = {"status": str(error), "paths": []}
+        metadata.update(closed, process_identity_stable=True)
+        (ARTIFACTS / "native-open-file-paths.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8")
+        return {**closed, "status": metadata["status"],
+                "process_identity_stable": True, "observed_paths": len(metadata["paths"])}
+    except NativeOpenFilesError as error:
+        return {**closed, "status": str(error)}
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError):
+        return {**closed, "status": "OPEN_HANDLE_NATIVE_METADATA_UNCONFIRMED"}
+
+
 def native_group_output_shape(raw):
     diagnostic = {"trimmed_bytes": len(raw)}
     if len(raw) > 65536:
@@ -624,10 +670,12 @@ def main():
             "PROBE_SYNTHETIC_LIBRARY_NONEMPTY_AFTER_RELAUNCH=true" in diagnostics)
         if not receipt["synthetic_library_nonempty_after_relaunch_observed"]:
             raise RuntimeError("SYNTHETIC_LIBRARY_PERSISTENCE_UNCONFIRMED")
-        receipt["native_store_schema"] = survey_native_schema(device_id)
-        receipt["shortcuts_group_metadata"] = collect_shortcuts_group_metadata(device_id)
-        receipt["native_entitlement_metadata"] = collect_native_entitlement_metadata(device_id)
-        receipt["status"] = "NATIVE_STORE_SCHEMA_OBSERVED_ONLY"
+        # Prior app/group schemas and empty entitlements are closed discoveries.
+        receipt["native_open_handle_metadata"] = collect_native_open_files(device_id)
+        receipt["status"] = receipt["native_open_handle_metadata"]["status"]
+        if receipt["status"] not in {
+                "OPEN_HANDLE_PATH_METADATA_OBSERVED", "NO_ASSOCIATED_OPEN_HANDLE_OBSERVED"}:
+            raise RuntimeError(receipt["status"])
         return 0
     except (RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
         receipt["status"] = "blocked"

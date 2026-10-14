@@ -10,6 +10,86 @@ import inspect_simulator as probe
 NATIVE_TIMEOUT_PROBE = probe.native_timeout_probe
 
 
+class OpenHandleBoundaryTests(unittest.TestCase):
+    def exercise(self, last_pid=123, lsof_exit=0, bundle_valid=True, internal_path=True):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            data = home / "Library/Developer/CoreSimulator/Devices/owned/data"
+            data.mkdir(parents=True)
+            inside = data / "observed.db"
+            inside.touch()
+            outside = home / "SENTINEL_PRIVATE_DO_NOT_RETAIN.db"
+            outside.touch()
+            lsof = f"p123\ncShortcuts\nn{outside}\n"
+            if internal_path:
+                lsof += f"n{inside}\n"
+            results = [probe.subprocess.CompletedProcess([], 0, b"not retained bundle path", b""),
+                       probe.subprocess.CompletedProcess([], 0, b"com.apple.shortcuts: 123\n", b""),
+                       probe.subprocess.CompletedProcess([], lsof_exit, lsof.encode(), b"PRIVATE_STDERR_SENTINEL"),
+                       probe.subprocess.CompletedProcess([], 0, f"com.apple.shortcuts: {last_pid}\n".encode(), b"")]
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "ARTIFACTS", home), \
+                    patch.object(probe, "verify_native_shortcuts_bundle",
+                                 side_effect=None if bundle_valid else RuntimeError("BUNDLE_ID_UNCONFIRMED")), \
+                    patch.object(probe, "command", side_effect=results) as command:
+                result = probe.collect_native_open_files("owned")
+            artifact = home / "native-open-file-paths.json"
+            metadata = artifact.read_text() if artifact.exists() else None
+            return result, metadata, command.call_args_list
+
+    def test_only_own_relative_paths_survive_stable_native_process(self):
+        result, metadata, calls = self.exercise()
+        self.assertEqual(result["status"], "OPEN_HANDLE_PATH_METADATA_OBSERVED")
+        self.assertEqual(result["observed_paths"], 1)
+        self.assertTrue(result["process_identity_stable"])
+        self.assertFalse(result["open_handle_contents_read"])
+        self.assertEqual(json.loads(metadata)["paths"], ["observed.db"])
+        self.assertNotIn("SENTINEL", metadata)
+        self.assertEqual(calls[2].args[0], ["lsof", "-nP", "-a", "-p", "123", "-Fpcn"])
+        self.assertEqual(calls[2].kwargs["timeout"], 10)
+
+    def test_changed_pid_discards_valid_paths_and_every_raw_diagnostic(self):
+        result, metadata, _ = self.exercise(last_pid=456)
+        self.assertEqual(result["status"], "OPEN_HANDLE_PID_UNSTABLE")
+        self.assertIsNone(metadata)
+        self.assertNotIn("SENTINEL", str(result))
+        self.assertNotIn("paths", result)
+
+    def test_own_device_or_data_symlink_prevents_every_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            device = home / "Library/Developer/CoreSimulator/Devices/owned"
+            data = device / "data"
+            data.mkdir(parents=True)
+            for linked in (device, data):
+                with self.subTest(linked=linked.name), \
+                        patch.object(Path, "home", return_value=home), \
+                        patch.object(Path, "is_symlink", autospec=True,
+                                     side_effect=lambda path: path == linked), \
+                        patch.object(probe, "command") as command:
+                    result = probe.collect_native_open_files("owned")
+                self.assertEqual(result["status"], "OPEN_HANDLE_OWN_DATA_UNCONFIRMED")
+                command.assert_not_called()
+
+    def test_zero_owned_handles_is_not_store_absence(self):
+        result, metadata, _ = self.exercise(internal_path=False)
+        self.assertEqual(result["status"], "NO_ASSOCIATED_OPEN_HANDLE_OBSERVED")
+        self.assertEqual(json.loads(metadata)["paths"], [])
+        self.assertTrue(result["process_identity_stable"])
+        self.assertFalse(result["condition_payload_proven"])
+
+    def test_bundle_failure_prevents_launch_and_nonzero_lsof_is_unconfirmed(self):
+        result, metadata, calls = self.exercise(bundle_valid=False)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(metadata)
+        self.assertEqual(result["status"], "OPEN_HANDLE_NATIVE_METADATA_UNCONFIRMED")
+        result, metadata, calls = self.exercise(lsof_exit=1)
+        self.assertEqual(result["status"], "OPEN_HANDLE_COMMAND_UNCONFIRMED")
+        self.assertEqual(len(calls), 3)
+        self.assertIsNone(metadata)
+        self.assertNotIn("SENTINEL", str(result))
+
+
 class ExportBoundaryTests(unittest.TestCase):
     def test_entitlements_do_not_scan_system_groups_when_key_is_missing(self):
         import native_entitlements
@@ -469,6 +549,11 @@ class SelectionTests(unittest.TestCase):
             "status": "SYSTEM_GROUP_ENTITLEMENT_NOT_DECLARED", "system_store_read": False})
         self.entitlements_probe = entitlements_probe.start()
         self.addCleanup(entitlements_probe.stop)
+        open_probe = patch.object(probe, "collect_native_open_files", return_value={
+            "status": "OPEN_HANDLE_PATH_METADATA_OBSERVED", "observed_paths": 1,
+            "open_handle_contents_read": False, "condition_payload_proven": False})
+        self.open_probe = open_probe.start()
+        self.addCleanup(open_probe.stop)
         self.runtimes = {"runtimes": [{"isAvailable": True, "version": "27.0",
                          "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-27-0"}]}
         self.types = {"devicetypes": [{"name": "iPhone Test", "identifier": "test.iphone",
@@ -610,8 +695,11 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(receipt["bootstatus_exit"], 0)
             self.assertFalse(receipt["message_access"])
             self.assertFalse(receipt["otp_proven"])
-            self.assertEqual(receipt["status"], "NATIVE_STORE_SCHEMA_OBSERVED_ONLY")
-            self.schema_probe.assert_called_once_with(identifier)
+            self.assertEqual(receipt["status"], "OPEN_HANDLE_PATH_METADATA_OBSERVED")
+            self.open_probe.assert_called_once_with(identifier)
+            self.schema_probe.assert_not_called()
+            self.groups_probe.assert_not_called()
+            self.entitlements_probe.assert_not_called()
             build_call = next(call for call in command.call_args_list
                               if call.args[0][:2] == ["xcodebuild", "test"])
             self.assertEqual(build_call.kwargs["env"]["TEST_RUNNER_SHORTCUTS_PROBE_MODE"], "schema-only")
@@ -641,6 +729,7 @@ class SelectionTests(unittest.TestCase):
             self.schema_probe.assert_not_called()
             self.entitlements_probe.assert_not_called()
             self.groups_probe.assert_not_called()
+            self.open_probe.assert_not_called()
             receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
             self.assertEqual(receipt["failure"], "UI_TEST_FAILED")
             self.assertNotIn("native_entitlement_metadata", receipt)
