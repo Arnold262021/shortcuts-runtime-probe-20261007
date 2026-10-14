@@ -336,6 +336,86 @@ def collect_shortcuts_group_metadata(device_id):
         return {"status": "GROUP_METADATA_NATIVE_COMMAND_UNCONFIRMED", "group_store_read": False}
 
 
+def verify_native_shortcuts_bundle(raw_path):
+    try:
+        bundle = Path(raw_path.decode("utf-8", "strict").strip())
+        if not bundle.is_absolute() or bundle.name != "Shortcuts.app" or bundle.is_symlink():
+            raise RuntimeError("SHORTCUTS_BUNDLE_PATH_UNCONFIRMED")
+        bundle = bundle.resolve(strict=True)
+        info = bundle / "Info.plist"
+        before = info.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 65536:
+            raise RuntimeError("SHORTCUTS_BUNDLE_INFO_UNCONFIRMED")
+        with os.fdopen(os.open(info, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as source:
+            opened = os.fstat(source.fileno())
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_size > 65536 or
+                    (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
+                raise RuntimeError("SHORTCUTS_BUNDLE_INFO_UNCONFIRMED")
+            raw = source.read(65537)
+        if len(raw) > 65536:
+            raise RuntimeError("SHORTCUTS_BUNDLE_INFO_UNCONFIRMED")
+        content = plistlib.loads(raw)
+        if not isinstance(content, dict) or content.get("CFBundleIdentifier") != "com.apple.shortcuts":
+            raise RuntimeError("SHORTCUTS_BUNDLE_ID_UNCONFIRMED")
+        return bundle
+    except (OSError, ValueError, UnicodeDecodeError, plistlib.InvalidFileException, ExpatError) as error:
+        raise RuntimeError("SHORTCUTS_BUNDLE_INFO_UNCONFIRMED") from error
+
+
+def collect_native_entitlement_metadata(device_id):
+    from native_entitlements import NativeEntitlementsError, parse_codesign_entitlements, locate_declared_system_groups
+    from native_store_schema import NativeStoreSchemaError, survey_shortcuts_schema
+
+    try:
+        resolved = command(["xcrun", "simctl", "get_app_container", device_id,
+                            "com.apple.shortcuts", "app"], timeout=15, check=False)
+        if resolved.returncode:
+            return {"status": "SHORTCUTS_BUNDLE_COMMAND_UNCONFIRMED", "system_store_read": False}
+        bundle = verify_native_shortcuts_bundle(resolved.stdout)
+        signed = command(["codesign", "-d", "--entitlements", ":-", str(bundle)], timeout=15, check=False)
+        if signed.returncode:
+            return {"status": "CODESIGN_METADATA_COMMAND_UNCONFIRMED", "system_store_read": False}
+        metadata = parse_codesign_entitlements(signed.stdout, signed.stderr)
+        (ARTIFACTS / "native-entitlement-types.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8")
+        if not metadata["system_groups"]:
+            return {"status": metadata["system_groups_status"] if not metadata["system_groups_declared"]
+                    else "SYSTEM_GROUP_ENTITLEMENT_EMPTY", "system_store_read": False}
+        own_data = (Path.home() / "Library/Developer/CoreSimulator/Devices" /
+                    device_id / "data").resolve(strict=True)
+        groups = locate_declared_system_groups(own_data, metadata["system_groups"])
+        if (not groups or len(groups) != len(metadata["system_groups"]) or
+                {group["identifier"] for group in groups} != set(metadata["system_groups"])):
+            raise RuntimeError("DECLARED_SYSTEM_GROUP_SCOPE_UNCONFIRMED")
+        system_root = own_data / "Containers/Shared/SystemGroup"
+        for group in groups:
+            path = group["path"]
+            if (group["identifier"] not in metadata["system_groups"] or
+                    path.parent != system_root or path.is_symlink() or not path.is_dir()):
+                raise RuntimeError("DECLARED_SYSTEM_GROUP_SCOPE_UNCONFIRMED")
+        surveys = []
+        failed = 0
+        for group in groups:
+            path = group["path"]
+            try:
+                survey = survey_shortcuts_schema(path, include_inventory=False)
+            except NativeStoreSchemaError as error:
+                survey = {"status": str(error), "schema_only": True}
+                failed += 1
+            surveys.append({"identifier": group["identifier"],
+                            "path": path.relative_to(own_data).as_posix(), "survey": survey})
+        (ARTIFACTS / "native-system-group-schema.json").write_text(
+            json.dumps({"scope": "schema_only_no_rows_no_database_copy", "groups": surveys}, indent=2),
+            encoding="utf-8")
+        return {"status": "SYSTEM_GROUP_SCHEMA_ONLY" if not failed else "SYSTEM_GROUP_SCHEMA_PARTIAL_UNCONFIRMED",
+                "surveyed_ok": len(surveys) - failed, "failed": failed,
+                "system_schema_read": not failed, "system_rows_read": False, "condition_payload_proven": False}
+    except NativeEntitlementsError as error:
+        return {"status": str(error), "system_store_read": False}
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError):
+        return {"status": "NATIVE_BUNDLE_METADATA_UNCONFIRMED", "system_store_read": False}
+
+
 def native_group_output_shape(raw):
     diagnostic = {"trimmed_bytes": len(raw)}
     if len(raw) > 65536:
@@ -546,6 +626,7 @@ def main():
             raise RuntimeError("SYNTHETIC_LIBRARY_PERSISTENCE_UNCONFIRMED")
         receipt["native_store_schema"] = survey_native_schema(device_id)
         receipt["shortcuts_group_metadata"] = collect_shortcuts_group_metadata(device_id)
+        receipt["native_entitlement_metadata"] = collect_native_entitlement_metadata(device_id)
         receipt["status"] = "NATIVE_STORE_SCHEMA_OBSERVED_ONLY"
         return 0
     except (RuntimeError, subprocess.TimeoutExpired, ValueError) as error:

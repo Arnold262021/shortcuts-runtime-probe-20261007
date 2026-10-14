@@ -11,6 +11,87 @@ NATIVE_TIMEOUT_PROBE = probe.native_timeout_probe
 
 
 class ExportBoundaryTests(unittest.TestCase):
+    def test_entitlements_do_not_scan_system_groups_when_key_is_missing(self):
+        import native_entitlements
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = Path(directory)
+            results = [probe.subprocess.CompletedProcess([], 0, b"not retained bundle path", b""),
+                       probe.subprocess.CompletedProcess([], 0, plistlib.dumps({"public.permission": True}),
+                                                        b"Executable=/private/SENTINEL")]
+            with patch.object(probe, "ARTIFACTS", artifacts), \
+                    patch.object(probe, "verify_native_shortcuts_bundle", return_value=Path("bundle/Shortcuts.app")), \
+                    patch.object(probe, "command", side_effect=results), \
+                    patch.object(native_entitlements, "locate_declared_system_groups") as locate:
+                result = probe.collect_native_entitlement_metadata("owned")
+            locate.assert_not_called()
+            self.assertEqual(result["status"], "SYSTEM_GROUP_ENTITLEMENT_NOT_DECLARED")
+            self.assertFalse(result["system_store_read"])
+            self.assertNotIn("SENTINEL", (artifacts / "native-entitlement-types.json").read_text())
+
+    def test_bundle_info_identity_is_exact_before_codesign(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "Shortcuts.app"
+            bundle.mkdir()
+            info = bundle / "Info.plist"
+            info.write_bytes(plistlib.dumps({"CFBundleIdentifier": "com.apple.shortcuts"}))
+            self.assertEqual(probe.verify_native_shortcuts_bundle(str(bundle).encode()), bundle.resolve())
+            info.write_bytes(plistlib.dumps({"CFBundleIdentifier": "different.app"}))
+            with self.assertRaisesRegex(RuntimeError, "BUNDLE_ID_UNCONFIRMED"):
+                probe.verify_native_shortcuts_bundle(str(bundle).encode())
+            with patch.object(probe, "command", return_value=probe.subprocess.CompletedProcess([], 0, str(bundle).encode(), b"")) as command:
+                result = probe.collect_native_entitlement_metadata("owned")
+            self.assertEqual(command.call_count, 1)
+            self.assertFalse(result["system_store_read"])
+
+    def test_declared_system_schema_requires_positive_exact_metadata_association(self):
+        import native_entitlements
+        import native_store_schema
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            own_data = home / "Library/Developer/CoreSimulator/Devices/owned/data"
+            group = own_data / "Containers/Shared/SystemGroup/declared"
+            group.mkdir(parents=True)
+            outputs = [probe.subprocess.CompletedProcess([], 0, b"bundle path not retained", b""),
+                       probe.subprocess.CompletedProcess([], 0, plistlib.dumps({
+                           "com.apple.security.system-groups": ["systemgroup.synthetic"]}), b"")]
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "ARTIFACTS", home), \
+                    patch.object(probe, "verify_native_shortcuts_bundle", return_value=Path("bundle/Shortcuts.app")), \
+                    patch.object(probe, "command", side_effect=outputs), \
+                    patch.object(native_entitlements, "locate_declared_system_groups",
+                                 return_value=[{"identifier": "systemgroup.synthetic", "path": group.resolve()}]) as locate, \
+                    patch.object(native_store_schema, "survey_shortcuts_schema", return_value={"databases": []}) as survey:
+                result = probe.collect_native_entitlement_metadata("owned")
+            locate.assert_called_once_with(own_data.resolve(), ["systemgroup.synthetic"])
+            survey.assert_called_once_with(group.resolve(), include_inventory=False)
+            self.assertEqual(result["status"], "SYSTEM_GROUP_SCHEMA_ONLY")
+            self.assertFalse(result["system_rows_read"])
+            retained = (home / "native-system-group-schema.json").read_text()
+            self.assertNotIn(str(home), retained)
+
+    def test_system_association_missing_or_outside_never_reaches_schema(self):
+        import native_entitlements
+        import native_store_schema
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            own_data = home / "Library/Developer/CoreSimulator/Devices/owned/data"
+            own_data.mkdir(parents=True)
+            outside = home / "outside"
+            outside.mkdir()
+            for groups in ([], [{"identifier": "systemgroup.synthetic", "path": outside.resolve()}]):
+                outputs = [probe.subprocess.CompletedProcess([], 0, b"bundle", b""),
+                           probe.subprocess.CompletedProcess([], 0, plistlib.dumps({
+                               "com.apple.security.system-groups": ["systemgroup.synthetic"]}), b"")]
+                with patch.object(Path, "home", return_value=home), \
+                        patch.object(probe, "ARTIFACTS", home), \
+                        patch.object(probe, "verify_native_shortcuts_bundle", return_value=Path("bundle/Shortcuts.app")), \
+                        patch.object(probe, "command", side_effect=outputs), \
+                        patch.object(native_entitlements, "locate_declared_system_groups", return_value=groups), \
+                        patch.object(native_store_schema, "survey_shortcuts_schema") as survey:
+                    result = probe.collect_native_entitlement_metadata("owned")
+                survey.assert_not_called()
+                self.assertFalse(result["system_store_read"])
+
     def test_fixture_metadata_finds_only_exact_shortcuts_identity_without_rpc(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -384,6 +465,10 @@ class SelectionTests(unittest.TestCase):
             "status": "GROUP_PATH_METADATA_ONLY", "groups": {}, "group_store_read": False})
         groups_probe.start()
         self.addCleanup(groups_probe.stop)
+        entitlements_probe = patch.object(probe, "collect_native_entitlement_metadata", return_value={
+            "status": "SYSTEM_GROUP_ENTITLEMENT_NOT_DECLARED", "system_store_read": False})
+        entitlements_probe.start()
+        self.addCleanup(entitlements_probe.stop)
         self.runtimes = {"runtimes": [{"isAvailable": True, "version": "27.0",
                          "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-27-0"}]}
         self.types = {"devicetypes": [{"name": "iPhone Test", "identifier": "test.iphone",
