@@ -242,7 +242,8 @@ class WdaLaunchPreflightTests(unittest.TestCase):
             return False
 
     def _launch(self, *, listener=b"p991\nn127.0.0.1:8100\n", command_line=None,
-                cleanup=None, prepare=None, status=b'{"value":{"ready":true}}'):
+                cleanup=None, prepare=None, status=b'{"value":{"ready":true}}',
+                variables=None, status_errors=(), module=preflight):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name) / "appium-host-preflight-wda-launch-test"
@@ -260,7 +261,9 @@ class WdaLaunchPreflightTests(unittest.TestCase):
             "CFBundleExecutable": "WebDriverAgentRunner-Runner",
         }))
         run = products / "Runner.xctestrun"
-        run.write_bytes(plistlib.dumps({"WebDriverAgentRunner": {"EnvironmentVariables": {}}}))
+        variables = {} if variables is None else variables
+        original_run = plistlib.dumps({"WebDriverAgentRunner": {"EnvironmentVariables": variables}})
+        run.write_bytes(original_run)
         container = (root / "CoreSimulator" / "Devices" / self.uuid / "data" / "Containers" /
                      "Bundle" / "Application" / "PRIVATE_SENTINEL" /
                      "WebDriverAgentRunner-Runner.app")
@@ -273,7 +276,7 @@ class WdaLaunchPreflightTests(unittest.TestCase):
         cleanup = cleanup if cleanup is not None else {"cleanup_errors": []}
         prepare = prepare if prepare is not None else mock.Mock(return_value=self.uuid)
         cleanup_device = mock.Mock(return_value=cleanup)
-        responses = [self._Response(status)]
+        responses = [*status_errors, self._Response(status)]
 
         def run_command(command, args, env, timeout, failure="HOST_PREFLIGHT_NPM_INSTALL"):
             if args[0] == "lsof":
@@ -294,20 +297,24 @@ class WdaLaunchPreflightTests(unittest.TestCase):
         wda = {"wda_package_version": "16.15.0", "private_paths": {
             "package_root_path": str(package), "derived_data_path": str(derived),
         }}
-        with mock.patch.object(preflight.sys, "platform", "darwin"), \
-                mock.patch.dict(preflight.os.environ, {"GITHUB_ACTIONS": "true"}), \
-                mock.patch.object(preflight.tempfile, "mkdtemp", return_value=str(root)), \
-                mock.patch.object(preflight, "_build_owned_wda", return_value=wda), \
-                mock.patch.object(preflight, "_run", side_effect=run_command), \
-                mock.patch.object(preflight, "_free_port", return_value=8100), \
-                mock.patch.object(preflight, "_WDA_CONFIGURATION_SHA256", expected_config), \
-                mock.patch.object(preflight, "build_opener", return_value=opener), \
-                mock.patch.object(preflight.subprocess, "Popen", return_value=process) as popen, \
-                mock.patch.object(preflight, "_cleanup_wda_launch", return_value=True) as stop, \
-                mock.patch.object(preflight, "_wda_endpoint_closed", return_value=True), \
-                mock.patch.object(preflight, "_validated_wda_outputs"), \
-                mock.patch.object(preflight, "_remove_owned_root"):
-            result = preflight.run_owned_wda_launch_preflight(mock.Mock(), {"PATH": os.environ["PATH"]}, prepare, cleanup_device)
+        cleanup_name = "_cleanup_wda_launch" if hasattr(module, "_cleanup_wda_launch") else "_cleanup"
+        with mock.patch.object(module.sys, "platform", "darwin"), \
+                mock.patch.dict(module.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                mock.patch.object(module.tempfile, "mkdtemp", return_value=str(root)), \
+                mock.patch.object(module, "_build_owned_wda", return_value=wda), \
+                mock.patch.object(module, "_run", side_effect=run_command), \
+                mock.patch.object(module, "_free_port", return_value=8100), \
+                mock.patch.object(module, "_WDA_CONFIGURATION_SHA256", expected_config), \
+                mock.patch.object(module, "build_opener", return_value=opener), \
+                mock.patch.object(module.subprocess, "Popen", return_value=process) as popen, \
+                mock.patch.object(module, cleanup_name, return_value=True) as stop, \
+                mock.patch.object(module.time, "sleep") as sleep, \
+                mock.patch.object(module, "_wda_endpoint_closed", return_value=True), \
+                mock.patch.object(module, "_validated_wda_outputs"), \
+                mock.patch.object(module, "_remove_owned_root"):
+            self._launch_observed = SimpleNamespace(root=root, run=run, original=original_run,
+                                                     prepare=prepare, popen=popen, sleep=sleep)
+            result = module.run_owned_wda_launch_preflight(mock.Mock(), {"PATH": os.environ["PATH"]}, prepare, cleanup_device)
         return result, prepare, cleanup_device, popen, stop, opener
 
     def test_wda_launch_positive_requires_only_local_wda_readiness(self):
@@ -320,8 +327,56 @@ class WdaLaunchPreflightTests(unittest.TestCase):
         stop.assert_called_once_with(popen.return_value)
         args = popen.call_args.args[0]
         self.assertEqual(args[:2], ["xcodebuild", "test-without-building"])
+        self.assertEqual(args[args.index("-destination") + 1], f"platform=iOS Simulator,id={self.uuid}")
+        self.assertEqual(args.count("-parallel-testing-enabled"), 1)
+        self.assertEqual(args[args.index("-parallel-testing-enabled") + 1], "NO")
         self.assertFalse(any("session" in str(value).lower() for value in args))
         self.assertEqual(opener.open.call_count, 1)
+
+    def test_wda_launch_counts_failed_status_get_attempts_without_leaking_errors(self):
+        errors = (preflight.URLError("URLError_PRIVATE"), OSError("OSError_PRIVATE"))
+        result, prepare, cleanup_device, popen, stop, opener = self._launch(status_errors=errors)
+        self.assertEqual(result["status"], "WDA_READY_ONLY")
+        self.assertEqual(result["status_requests"], 3)
+        self.assertEqual(opener.open.call_count, 3)
+        self.assertTrue(all(call.args[0].get_method() == "GET" for call in opener.open.call_args_list))
+        self._launch_observed.sleep.assert_has_calls([mock.call(1), mock.call(1)])
+        popen.assert_called_once()
+        prepare.assert_called_once_with()
+        cleanup_device.assert_called_once_with()
+        stop.assert_called_once_with(popen.return_value)
+        self.assertNotIn("PRIVATE", str(result))
+
+    def test_wda_launch_replaces_only_owned_bindings(self):
+        variables = {
+            "USE_IP": "10.0.0.9",
+            "USE_PORT": "7777",
+            "SDKPRIVATE_KEY": "PRIVATE_SENTINEL",
+        }
+        result, prepare, cleanup_device, popen, stop, opener = self._launch(variables=variables)
+        observed = self._launch_observed
+        actual = plistlib.loads(observed.run.read_bytes())["WebDriverAgentRunner"]["EnvironmentVariables"]
+        self.assertEqual(actual, {
+            "USE_IP": "127.0.0.1",
+            "USE_PORT": "8100",
+            "SDKPRIVATE_KEY": "PRIVATE_SENTINEL",
+        })
+        self.assertEqual((observed.root / "original.xctestrun.bak").read_bytes(), observed.original)
+        self.assertEqual(result["status"], "WDA_READY_ONLY")
+        self.assertNotIn("PRIVATE_SENTINEL", str(result))
+        prepare.assert_called_once_with()
+        cleanup_device.assert_called_once_with()
+        popen.assert_called_once()
+        stop.assert_called_once_with(popen.return_value)
+        opener.open.assert_called_once()
+
+    def test_wda_launch_rejects_non_mapping_environment_without_prepare_or_popen(self):
+        for variables in (False, [], "not-a-mapping"):
+            with self.subTest(variables=variables), self.assertRaises(preflight.AppiumHostPreflightError) as caught:
+                self._launch(variables=variables)
+            self.assertEqual(caught.exception.code, "HOST_WDA_LAUNCH_FORMAT")
+            self._launch_observed.prepare.assert_not_called()
+            self._launch_observed.popen.assert_not_called()
 
     def test_wda_launch_rejects_listener_without_exact_loopback_owner(self):
         for listener in (b"", b"p991\nn0.0.0.0:8100\n", b"p991\nn[::1]:8100\n",

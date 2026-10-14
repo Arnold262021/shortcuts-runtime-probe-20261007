@@ -241,7 +241,7 @@ def run_owned_wda_launch_preflight(command: Callable[..., object], safe_env: dic
                 or Path(executable).name != executable or executable in {".", ".."}):
             raise AppiumHostPreflightError("HOST_WDA_LAUNCH_FORMAT")
         variables = target.get("EnvironmentVariables", {})
-        if not isinstance(variables, dict) or "USE_IP" in variables or "USE_PORT" in variables:
+        if not isinstance(variables, dict):
             raise AppiumHostPreflightError("HOST_WDA_LAUNCH_FORMAT")
         port = _free_port()
         target["EnvironmentVariables"] = dict(variables, USE_IP="127.0.0.1", USE_PORT=str(port))
@@ -270,7 +270,7 @@ def run_owned_wda_launch_preflight(command: Callable[..., object], safe_env: dic
         with (root / "wda.stdout").open("wb") as stdout, (root / "wda.stderr").open("wb") as stderr:
             try:
                 process = subprocess.Popen(["xcodebuild", "test-without-building", "-xctestrun", str(runs[0]),
-                    "-destination", f"platform=iOS Simulator,id={device}"], stdin=subprocess.DEVNULL,
+                    "-destination", f"platform=iOS Simulator,id={device}", "-parallel-testing-enabled", "NO"], stdin=subprocess.DEVNULL,
                     stdout=stdout, stderr=stderr, env=env, start_new_session=True)
                 observed["test_launch_attempted"] = True
             except OSError:
@@ -281,8 +281,8 @@ def run_owned_wda_launch_preflight(command: Callable[..., object], safe_env: dic
                 if remaining <= 0 or process.poll() is not None:
                     break
                 try:
+                    observed["status_requests"] += 1
                     with opener.open(Request(f"http://127.0.0.1:{port}/status", method="GET"), timeout=min(3, remaining)) as response:
-                        observed["status_requests"] += 1
                         raw = response.read(_JSON_LIMIT + 1)
                         body = _bounded_json(raw, "HOST_WDA_LAUNCH_READY")
                         value = body.get("value") if isinstance(body, dict) else None
