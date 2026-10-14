@@ -11,18 +11,23 @@ NATIVE_TIMEOUT_PROBE = probe.native_timeout_probe
 
 
 class OpenHandleBoundaryTests(unittest.TestCase):
-    def exercise(self, last_pid=123, lsof_exit=0, bundle_valid=True, internal_path=True):
+    def exercise(self, last_pid=123, lsof_exit=0, bundle_valid=True, internal_path=True,
+                 inspect_schema=False, observed_name="observed.db", stale_artifact=False):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()
             data = home / "Library/Developer/CoreSimulator/Devices/owned/data"
             data.mkdir(parents=True)
-            inside = data / "observed.db"
+            inside = data / observed_name
+            inside.parent.mkdir(parents=True, exist_ok=True)
             inside.touch()
             outside = home / "SENTINEL_PRIVATE_DO_NOT_RETAIN.db"
             outside.touch()
             lsof = f"p123\ncShortcuts\nf3u\nn{outside}\n"
             if internal_path:
                 lsof += f"f4u\nn{inside}\n"
+            if stale_artifact:
+                (home / "native-open-file-paths.json").write_text(json.dumps({
+                    "paths": ["Library/Shortcuts/Shortcuts.sqlite"]}))
             results = [probe.subprocess.CompletedProcess([], 0, b"not retained bundle path", b""),
                        probe.subprocess.CompletedProcess([], 0, b"com.apple.shortcuts: 123\n", b""),
                        probe.subprocess.CompletedProcess([], lsof_exit, lsof.encode(), b"PRIVATE_STDERR_SENTINEL"),
@@ -32,9 +37,13 @@ class OpenHandleBoundaryTests(unittest.TestCase):
                     patch.object(probe, "verify_native_shortcuts_bundle",
                                  side_effect=None if bundle_valid else RuntimeError("BUNDLE_ID_UNCONFIRMED")), \
                     patch.object(probe, "command", side_effect=results) as command:
-                result = probe.collect_native_open_files("owned")
+                result = probe.collect_native_open_files("owned", inspect_schema=inspect_schema)
             artifact = home / "native-open-file-paths.json"
             metadata = artifact.read_text() if artifact.exists() else None
+            schema_file = home / "native-shortcuts-library-schema.json"
+            self.assertEqual(schema_file.exists(), result["status"] == "SHORTCUTS_LIBRARY_SCHEMA_ONLY")
+            if schema_file.exists():
+                self.assertNotIn("SENTINEL", schema_file.read_text())
             shape_file = home / "native-shortcuts-lsof-shape.json"
             if shape_file.exists():
                 shape = shape_file.read_text()
@@ -95,6 +104,66 @@ class OpenHandleBoundaryTests(unittest.TestCase):
         self.assertEqual(result["status"], "OPEN_HANDLE_COMMAND_UNCONFIRMED")
         self.assertEqual(len(calls), 3)
         self.assertIsNone(metadata)
+        self.assertNotIn("SENTINEL", str(result))
+
+    def test_schema_mode_binds_only_current_owned_observation(self):
+        target = "Library/Shortcuts/Shortcuts.sqlite"
+        survey = {"schema_only": True, "candidate_count": 1,
+                  "databases": [{"path": target, "objects": []}]}
+        with patch("native_store_schema.survey_observed_shortcuts_file", return_value=survey) as read:
+            result, metadata, calls = self.exercise(inspect_schema=True, observed_name=target)
+        self.assertEqual(result["status"], "SHORTCUTS_LIBRARY_SCHEMA_ONLY")
+        self.assertTrue(result["open_handle_contents_read"])
+        self.assertTrue(result["schema_attempted"])
+        self.assertFalse(result["row_values_read"])
+        self.assertFalse(result["condition_payload_proven"])
+        self.assertEqual(result["schema_databases"], 1)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(read.call_args.args[1], [target])
+        self.assertEqual(read.call_args.args[0].name, "data")
+        self.assertEqual(len(calls), 4)
+        self.assertFalse(json.loads(metadata)["open_handle_contents_read"])
+
+    def test_schema_mode_cannot_reuse_old_artifact_or_other_current_db(self):
+        for internal in (False, True):
+            with self.subTest(internal=internal), patch("native_store_schema.sqlite3.connect") as connect:
+                result, metadata, _ = self.exercise(inspect_schema=True, internal_path=internal,
+                                                    stale_artifact=True)
+            connect.assert_not_called()
+            self.assertEqual(result["status"], "SHORTCUTS_LIBRARY_SCHEMA_UNCONFIRMED")
+            self.assertEqual(result["schema_error"], "OBSERVED_SHORTCUTS_PATH_MISSING")
+            self.assertNotIn("Library/Shortcuts/Shortcuts.sqlite", json.loads(metadata)["paths"])
+
+    def test_partial_schema_failure_does_not_claim_contents_unread(self):
+        from native_store_schema import NativeStoreSchemaError
+        with patch("native_store_schema.survey_observed_shortcuts_file", side_effect=
+                   NativeStoreSchemaError("SQLITE_SCHEMA_QUERY_FAILED")):
+            result, _, _ = self.exercise(inspect_schema=True)
+        self.assertEqual(result["status"], "SHORTCUTS_LIBRARY_SCHEMA_UNCONFIRMED")
+        self.assertEqual(result["open_handle_contents_read"], "unconfirmed")
+        self.assertFalse(result["row_values_read"])
+
+    def test_schema_never_runs_when_pid_changed_or_in_metadata_mode(self):
+        with patch("native_store_schema.survey_observed_shortcuts_file") as read:
+            result, _, _ = self.exercise(inspect_schema=True, last_pid=456)
+            self.assertEqual(result["status"], "OPEN_HANDLE_PID_UNSTABLE")
+            self.exercise()
+        read.assert_not_called()
+
+    def test_schema_artifact_write_failure_never_claims_contents_unread(self):
+        real_write = Path.write_text
+
+        def fail_schema_write(path, *args, **kwargs):
+            if path.name == "native-shortcuts-library-schema.json":
+                raise OSError("PRIVATE_SENTINEL")
+            return real_write(path, *args, **kwargs)
+
+        with patch("native_store_schema.survey_observed_shortcuts_file", return_value={
+                "schema_only": True, "databases": []}), \
+                patch.object(Path, "write_text", autospec=True, side_effect=fail_schema_write):
+            result, _, _ = self.exercise(inspect_schema=True)
+        self.assertEqual(result["status"], "OPEN_HANDLE_NATIVE_METADATA_UNCONFIRMED")
+        self.assertEqual(result["open_handle_contents_read"], "unconfirmed")
         self.assertNotIn("SENTINEL", str(result))
 
 
@@ -726,6 +795,36 @@ class SelectionTests(unittest.TestCase):
             self.assertFalse(receipt["synthetic_library_nonempty_after_relaunch_observed"])
             self.assertFalse(receipt["otp_proven"])
 
+    def test_schema_trial_requires_schema_success_not_metadata_success(self):
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+
+        def fake_command(args, **kwargs):
+            stdout = identifier.encode() if args[1:3] == ["simctl", "create"] else b""
+            if args[:2] == ["xcodebuild", "test"]:
+                stdout = b"PROBE_SYNTHETIC_FILTER_READY=true\nPROBE_SYNTHETIC_LIBRARY_NONEMPTY_AFTER_RELAUNCH=true\n"
+            return probe.subprocess.CompletedProcess(args, 0, stdout, b"")
+
+        for status, expected in (("SHORTCUTS_LIBRARY_SCHEMA_ONLY", 0),
+                                 ("SHORTCUTS_LIBRARY_SCHEMA_UNCONFIRMED", 1),
+                                 ("OPEN_HANDLE_PATH_METADATA_OBSERVED", 1),
+                                 ("NO_ASSOCIATED_OPEN_HANDLE_OBSERVED", 1)):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(probe, "ROOT", Path(directory) / "probe"), \
+                    patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                    patch.object(probe.sys, "platform", "darwin"), \
+                    patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                               "SHORTCUTS_PROBE_EXECUTION_MODE": "observed-shortcuts-schema"}), \
+                    patch.object(probe, "sim_json", side_effect=[self.runtimes, self.devices, self.types]), \
+                    patch.object(probe, "command", side_effect=fake_command), patch("builtins.print"):
+                self.open_probe.reset_mock()
+                self.open_probe.return_value = {"status": status}
+                self.assertEqual(probe.main(), expected)
+                self.open_probe.assert_called_once_with(identifier, inspect_schema=True)
+                receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+                self.assertFalse(receipt["otp_proven"])
+                if expected:
+                    self.assertEqual(receipt["failure"], status)
+
     def test_device_id_rejects_malformed_and_noncanonical(self):
         for identifier in (b"", b"not-a-uuid", b"ABCDEF0123456789ABCDEF0123456789",
                            b"{ABCDEF01-2345-6789-ABCD-EF0123456789}"):
@@ -774,7 +873,7 @@ class SelectionTests(unittest.TestCase):
             self.assertFalse(receipt["message_access"])
             self.assertFalse(receipt["otp_proven"])
             self.assertEqual(receipt["status"], "OPEN_HANDLE_PATH_METADATA_OBSERVED")
-            self.open_probe.assert_called_once_with(identifier)
+            self.open_probe.assert_called_once_with(identifier, inspect_schema=False)
             self.schema_probe.assert_not_called()
             self.groups_probe.assert_not_called()
             self.entitlements_probe.assert_not_called()

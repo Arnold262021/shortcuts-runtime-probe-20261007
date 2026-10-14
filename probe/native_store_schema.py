@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import sys
 import time
 from typing import Iterator
 from urllib.parse import quote
@@ -26,6 +27,7 @@ MAX_IDENTIFIER_BYTES = 128
 SCHEMA_DEADLINE_SECONDS = 5.0
 SQLITE_MAGIC = b"SQLite format 3\x00"
 SQLITE_SUFFIXES = {".sqlite", ".sqlite3", ".db"}
+OBSERVED_SHORTCUTS_RELATIVE_PATH = "Library/Shortcuts/Shortcuts.sqlite"
 
 _ERROR_CODES = frozenset(
     {
@@ -40,12 +42,21 @@ _ERROR_CODES = frozenset(
         "FILE_INVENTORY_LIMIT",
         "SQLITE_FILE_SIZE_LIMIT",
         "SQLITE_OPEN_FAILED",
+        "SQLITE_SETUP_FAILED",
+        "SQLITE_CLOSE_FAILED",
         "SQLITE_SCHEMA_QUERY_FAILED",
         "SQLITE_TABLE_INFO_FAILED",
         "SQLITE_PROGRESS_LIMIT",
         "SCHEMA_OBJECT_LIMIT",
         "SCHEMA_COLUMN_LIMIT",
         "SCHEMA_IDENTIFIER_LIMIT",
+        "OBSERVED_SHORTCUTS_PATH_MISSING",
+        "OBSERVED_SHORTCUTS_PATH_AMBIGUOUS",
+        "OBSERVED_SHORTCUTS_PATH_MISMATCH",
+        "OBSERVED_SHORTCUTS_FILE_MISSING",
+        "OBSERVED_SHORTCUTS_FILE_MISMATCH",
+        "OBSERVED_SHORTCUTS_FILE_UNCONFIRMED",
+        "OBSERVED_SHORTCUTS_HEADER_INVALID",
     }
 )
 
@@ -219,9 +230,12 @@ def _survey_database(path: Path, root: Path, deadline: float) -> dict[str, objec
         return int(time.monotonic() >= deadline)
 
     try:
-        connection.execute("PRAGMA query_only=ON")
-        connection.set_authorizer(_schema_authorizer)
-        connection.set_progress_handler(stop_after_deadline, 1_000)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.set_authorizer(_schema_authorizer)
+            connection.set_progress_handler(stop_after_deadline, 1_000)
+        except sqlite3.Error as error:
+            raise NativeStoreSchemaError("SQLITE_SETUP_FAILED") from error
         try:
             objects = connection.execute(
                 "SELECT name, type FROM sqlite_master "
@@ -261,13 +275,103 @@ def _survey_database(path: Path, root: Path, deadline: float) -> dict[str, objec
                 )
             report_objects.append({"name": name, "kind": kind, "columns": report_columns})
     finally:
-        connection.close()
+        prior_failure = sys.exc_info()[0] is not None
+        try:
+            connection.close()
+        except sqlite3.Error as error:
+            # A close failure matters only when it is the sole failure; never
+            # replace a prior sanitized setup/query/boundary error with it.
+            if not prior_failure:
+                raise NativeStoreSchemaError("SQLITE_CLOSE_FAILED") from error
 
     try:
         relative_path = path.relative_to(root).as_posix()
     except ValueError as error:
         raise NativeStoreSchemaError("CONTAINER_ESCAPE") from error
     return {"path": relative_path, "objects": report_objects}
+
+
+def _require_observed_shortcuts_path(observed_paths: list[str]) -> None:
+    if not isinstance(observed_paths, list) or not all(isinstance(path, str) for path in observed_paths):
+        raise NativeStoreSchemaError("OBSERVED_SHORTCUTS_PATH_MISMATCH")
+    matches = sum(path == OBSERVED_SHORTCUTS_RELATIVE_PATH for path in observed_paths)
+    if matches == 0:
+        raise NativeStoreSchemaError("OBSERVED_SHORTCUTS_PATH_MISSING")
+    if matches != 1:
+        raise NativeStoreSchemaError("OBSERVED_SHORTCUTS_PATH_AMBIGUOUS")
+
+
+def _observed_shortcuts_file(root: Path) -> tuple[Path, tuple[int, int]]:
+    library = root / "Library"
+    shortcuts = library / "Shortcuts"
+    database = shortcuts / "Shortcuts.sqlite"
+    for component, expected_directory in ((library, True), (shortcuts, True), (database, False)):
+        try:
+            component_status = component.lstat()
+        except FileNotFoundError as error:
+            raise NativeStoreSchemaError("OBSERVED_SHORTCUTS_FILE_MISSING") from error
+        except OSError as error:
+            raise NativeStoreSchemaError("OBSERVED_SHORTCUTS_FILE_UNCONFIRMED") from error
+        if stat.S_ISLNK(component_status.st_mode):
+            raise NativeStoreSchemaError("CONTAINER_SYMLINK")
+        if (expected_directory and not stat.S_ISDIR(component_status.st_mode)) or (
+            not expected_directory and not stat.S_ISREG(component_status.st_mode)
+        ):
+            raise NativeStoreSchemaError("OBSERVED_SHORTCUTS_FILE_MISMATCH")
+        try:
+            resolved = component.resolve(strict=True)
+        except OSError as error:
+            raise NativeStoreSchemaError("OBSERVED_SHORTCUTS_FILE_UNCONFIRMED") from error
+        if not _within(resolved, root):
+            raise NativeStoreSchemaError("CONTAINER_ESCAPE")
+    return database, (component_status.st_dev, component_status.st_ino)
+
+
+def _validate_observed_sqlite_header(path: Path, expected_identity: tuple[int, int]) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise NativeStoreSchemaError("OBSERVED_SHORTCUTS_FILE_UNCONFIRMED") from error
+    try:
+        opened_status = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_status.st_mode) or (
+            opened_status.st_dev,
+            opened_status.st_ino,
+        ) != expected_identity:
+            raise NativeStoreSchemaError("OBSERVED_SHORTCUTS_FILE_UNCONFIRMED")
+        if opened_status.st_size > MAX_SQLITE_BYTES:
+            raise NativeStoreSchemaError("SQLITE_FILE_SIZE_LIMIT")
+        magic = os.read(descriptor, len(SQLITE_MAGIC))
+    except OSError as error:
+        raise NativeStoreSchemaError("OBSERVED_SHORTCUTS_FILE_UNCONFIRMED") from error
+    finally:
+        os.close(descriptor)
+    if magic != SQLITE_MAGIC:
+        raise NativeStoreSchemaError("OBSERVED_SHORTCUTS_HEADER_INVALID")
+
+
+def survey_observed_shortcuts_file(own_data: Path, observed_paths: list[str]) -> dict[str, object]:
+    """Return schema metadata for the one literal Shortcuts file observed now.
+
+    The caller supplies relative paths parsed from the same stable-process lsof
+    output. This routine neither scans nor inventories the container, and it
+    only opens the exact `Library/Shortcuts/Shortcuts.sqlite` path after
+    validating the literal observation and each local path component.
+    """
+    _require_observed_shortcuts_path(observed_paths)
+    deadline = time.monotonic() + SCHEMA_DEADLINE_SECONDS
+    root = _resolve_root(own_data)
+    _ensure_deadline(deadline)
+    database, identity = _observed_shortcuts_file(root)
+    _validate_observed_sqlite_header(database, identity)
+    report = _survey_database(database, root, deadline)
+    return {
+        "scope": "observed_shortcuts_file_schema_only",
+        "schema_only": True,
+        "candidate_count": 1,
+        "databases": [report],
+    }
 
 
 def survey_shortcuts_schema(container_root: Path, *, include_inventory: bool = False) -> dict[str, object]:

@@ -22,13 +22,14 @@ class ProbeLayoutTests(unittest.TestCase):
             published.parent.mkdir(parents=True)
             shutil.copyfile(workflow_source(ROOT), published)
             with patch(__name__ + ".ROOT", root):
-                self.test_workflow_exposes_only_the_two_bounded_lab_modes()
+                self.test_workflow_exposes_only_bounded_lab_modes()
 
-    def test_workflow_exposes_only_the_two_bounded_lab_modes(self) -> None:
+    def test_workflow_exposes_only_bounded_lab_modes(self) -> None:
         workflow = workflow_source(ROOT).read_text(encoding="utf-8")
         self.assertIn("type: choice", workflow)
         self.assertIn("default: open-handles", workflow)
         self.assertIn("- lsof-preflight", workflow)
+        self.assertIn("- observed-shortcuts-schema", workflow)
         self.assertIn("SHORTCUTS_PROBE_EXECUTION_MODE: ${{ inputs.probe_mode }}", workflow)
         self.assertIn("timeout-minutes: 15", workflow)
         self.assertIn("cancel-in-progress: false", workflow)

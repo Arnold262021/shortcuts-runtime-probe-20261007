@@ -11,6 +11,7 @@ name: Shortcuts Simulator Inspection
         options:
           - open-handles
           - lsof-preflight
+          - observed-shortcuts-schema
 
 permissions:
   contents: read

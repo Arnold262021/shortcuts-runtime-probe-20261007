@@ -416,7 +416,7 @@ def collect_native_entitlement_metadata(device_id):
         return {"status": "NATIVE_BUNDLE_METADATA_UNCONFIRMED", "system_store_read": False}
 
 
-def collect_native_open_files(device_id):
+def collect_native_open_files(device_id, *, inspect_schema=False):
     from native_open_files import NativeOpenFilesError, parse_simctl_launch, parse_lsof_metadata, lsof_output_shape
 
     closed = {"open_handle_contents_read": False, "database_copy": False,
@@ -459,8 +459,25 @@ def collect_native_open_files(device_id):
         metadata.update(closed, process_identity_stable=True)
         (ARTIFACTS / "native-open-file-paths.json").write_text(
             json.dumps(metadata, indent=2), encoding="utf-8")
-        return {**closed, "status": metadata["status"],
-                "process_identity_stable": True, "observed_paths": len(metadata["paths"])}
+        receipt = {**closed, "status": metadata["status"],
+                   "process_identity_stable": True, "observed_paths": len(metadata["paths"])}
+        if inspect_schema:
+            closed["open_handle_contents_read"] = "unconfirmed"
+            from native_store_schema import NativeStoreSchemaError, survey_observed_shortcuts_file
+            try:
+                survey = survey_observed_shortcuts_file(own_data, metadata["paths"])
+            except NativeStoreSchemaError as error:
+                return {**receipt, "status": "SHORTCUTS_LIBRARY_SCHEMA_UNCONFIRMED",
+                        "schema_error": str(error), "schema_only": True,
+                        "schema_attempted": True, "open_handle_contents_read": "unconfirmed",
+                        "row_values_read": False}
+            (ARTIFACTS / "native-shortcuts-library-schema.json").write_text(
+                json.dumps(survey, indent=2), encoding="utf-8")
+            receipt.update(status="SHORTCUTS_LIBRARY_SCHEMA_ONLY", schema_only=True,
+                           schema_attempted=True,
+                           open_handle_contents_read=True, row_values_read=False,
+                           schema_databases=len(survey["databases"]))
+        return receipt
     except NativeOpenFilesError as error:
         return {**closed, "status": str(error)}
     except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError):
@@ -621,7 +638,7 @@ def main():
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise RuntimeError("GITHUB_MACOS_RUNNER_REQUIRED")
     mode = os.environ.get("SHORTCUTS_PROBE_EXECUTION_MODE", "open-handles")
-    if mode not in {"open-handles", "lsof-preflight"}:
+    if mode not in {"open-handles", "lsof-preflight", "observed-shortcuts-schema"}:
         raise RuntimeError("UNKNOWN_PROBE_EXECUTION_MODE")
     ARTIFACTS.mkdir(exist_ok=False)
     TIMINGS.clear()
@@ -714,10 +731,12 @@ def main():
         if not receipt["synthetic_library_nonempty_after_relaunch_observed"]:
             raise RuntimeError("SYNTHETIC_LIBRARY_PERSISTENCE_UNCONFIRMED")
         # Prior app/group schemas and empty entitlements are closed discoveries.
-        receipt["native_open_handle_metadata"] = collect_native_open_files(device_id)
+        receipt["native_open_handle_metadata"] = collect_native_open_files(
+            device_id, inspect_schema=(mode == "observed-shortcuts-schema"))
         receipt["status"] = receipt["native_open_handle_metadata"]["status"]
-        if receipt["status"] not in {
-                "OPEN_HANDLE_PATH_METADATA_OBSERVED", "NO_ASSOCIATED_OPEN_HANDLE_OBSERVED"}:
+        accepted = ({"SHORTCUTS_LIBRARY_SCHEMA_ONLY"} if mode == "observed-shortcuts-schema" else
+                    {"OPEN_HANDLE_PATH_METADATA_OBSERVED", "NO_ASSOCIATED_OPEN_HANDLE_OBSERVED"})
+        if receipt["status"] not in accepted:
             raise RuntimeError(receipt["status"])
         return 0
     except (RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
