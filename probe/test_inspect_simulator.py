@@ -598,6 +598,9 @@ class ExportBoundaryTests(unittest.TestCase):
 
 class SelectionTests(unittest.TestCase):
     def setUp(self):
+        mode = patch.dict(probe.os.environ, {"SHORTCUTS_PROBE_EXECUTION_MODE": "open-handles"})
+        mode.start()
+        self.addCleanup(mode.stop)
         timeout_probe = patch.object(probe, "native_timeout_probe", return_value={
             "wrapper_return_bounded_with_descendant_present": True,
             "descendant_marker_seen": True, "seconds": 1.0})
