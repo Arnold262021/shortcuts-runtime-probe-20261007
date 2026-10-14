@@ -1,4 +1,5 @@
 import json
+import itertools
 import unittest
 from unittest.mock import patch
 
@@ -262,6 +263,16 @@ class FixtureFlowTests(unittest.TestCase):
         with patch("urllib.request.build_opener", return_value=wire):
             return subject.run_synthetic_appium_fixture(wire.endpoint, wire.uuid, mode="fixture")
 
+    def _assert_one_cleanup(self, wire):
+        cleanup = [call for call in wire.calls if call[0] == "DELETE"]
+        self.assertEqual(len(cleanup), 1)
+        self.assertEqual(cleanup[0][:3], ("DELETE", "/session/synthetic-session", None))
+        timeout = cleanup[0][3]
+        self.assertIsInstance(timeout, (int, float))
+        self.assertNotIsInstance(timeout, bool)
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, 10)
+
     def test_fixture_flow_executes_the_approved_synthetic_state_machine(self):
         wire = _FixtureWire(shortcuts_onboarding=True)
         result = self._run(wire)
@@ -276,7 +287,7 @@ class FixtureFlowTests(unittest.TestCase):
         terminate = scripts.index("mobile: terminateApp")
         self.assertNotIn("mobile: activateApp", scripts[:terminate])
         self.assertEqual(scripts[terminate + 1:].count("mobile: activateApp"), 1)
-        self.assertIn(("DELETE", "/session/synthetic-session", None, 10.0), wire.calls)
+        self._assert_one_cleanup(wire)
         forbidden = ("Run", "Share", "SaveToFiles", "SMS", "source")
         self.assertFalse(any(any(word in path or word in json.dumps(body) for word in forbidden) for _, path, body, _ in wire.calls))
         self.assertTrue(all(url_path.startswith("/session") for _, url_path, _, _ in wire.calls))
@@ -287,7 +298,7 @@ class FixtureFlowTests(unittest.TestCase):
         result = self._run(wire)
         self.assertEqual(result["failure_code"], "target_not_unique")
         self.assertNotIn("new", wire.clicked)
-        self.assertIn(("DELETE", "/session/synthetic-session", None, 10.0), wire.calls)
+        self._assert_one_cleanup(wire)
 
     def test_wrong_marker_value_blocks_before_done(self):
         wire = _FixtureWire(wrong_value=True)
@@ -313,7 +324,7 @@ class FixtureFlowTests(unittest.TestCase):
         result = self._run(wire)
         self.assertEqual(result["failure_code"], "http_ambiguous")
         self.assertEqual(wire.clicked.count("new"), 1)
-        self.assertIn(("DELETE", "/session/synthetic-session", None, 10.0), wire.calls)
+        self._assert_one_cleanup(wire)
 
     def test_termination_must_be_confirmed_before_reactivate(self):
         for observed in (False, 3, 4):
@@ -389,6 +400,22 @@ class FixtureFlowTests(unittest.TestCase):
                     result = self._run(wire)
                 self.assertEqual(result["failure_code"], "target_not_unique")
                 self.assertNotIn("done" if option == "multiple_done" else "back", wire.clicked)
+
+    def test_cleanup_timeout_accepts_monotonic_submicrosecond_drift(self):
+        wire = _FixtureWire()
+        ticks = itertools.count(1000.0, 0.0000001)
+        with patch.object(subject.time, "monotonic", side_effect=lambda: next(ticks)):
+            result = self._run(wire)
+        self.assertEqual(result["stage"], "completed")
+        self._assert_one_cleanup(wire)
+
+    def test_cleanup_helper_rejects_any_second_delete(self):
+        wire = _FixtureWire()
+        result = self._run(wire)
+        self.assertEqual(result["stage"], "completed")
+        wire.calls.append(("DELETE", "/session/synthetic-session", {}, 1.0))
+        with self.assertRaises(AssertionError):
+            self._assert_one_cleanup(wire)
 
 
 if __name__ == "__main__":
