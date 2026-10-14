@@ -1,0 +1,632 @@
+import unittest
+import tempfile
+import json
+import plistlib
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import inspect_simulator as probe
+
+NATIVE_TIMEOUT_PROBE = probe.native_timeout_probe
+
+
+class ExportBoundaryTests(unittest.TestCase):
+    def test_fixture_metadata_finds_only_exact_shortcuts_identity_without_rpc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            base = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Data/Application"
+            target = base / "shortcuts"
+            target.mkdir(parents=True)
+            other = base / "unrelated"
+            other.mkdir()
+            name = ".com.apple.mobile_container_manager.metadata.plist"
+            (target / name).write_bytes(plistlib.dumps({"MCMMetadataIdentifier": "com.apple.shortcuts"}))
+            (other / name).write_bytes(plistlib.dumps({"MCMMetadataIdentifier": "com.example.other"}))
+            (other / "private-row-data.db").write_bytes(b"PRIVATE_SENTINEL_DO_NOT_READ")
+            original_open = probe.os.open
+            opened = []
+
+            def metadata_only_open(path, *args, **kwargs):
+                self.assertEqual(Path(path).name, name)
+                opened.append(Path(path).name)
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe.os, "open", new=metadata_only_open), \
+                    patch.object(probe, "command") as command:
+                found = probe.find_owned_shortcuts_data_container("owned")
+            self.assertEqual(found, target.resolve())
+            self.assertEqual(len(opened), 2)
+            command.assert_not_called()
+
+    def test_fixture_metadata_rejects_ambiguous_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            base = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Data/Application"
+            for name in ("one", "two"):
+                folder = base / name
+                folder.mkdir(parents=True)
+                (folder / ".com.apple.mobile_container_manager.metadata.plist").write_bytes(
+                    plistlib.dumps({"MCMMetadataIdentifier": "com.apple.shortcuts"}))
+            with patch.object(Path, "home", return_value=home):
+                with self.assertRaisesRegex(RuntimeError, "METADATA_NOT_UNIQUE"):
+                    probe.find_owned_shortcuts_data_container("owned")
+
+    def test_fixture_metadata_rejects_missing_and_corrupt_descriptors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            base = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Data/Application"
+            target = base / "shortcuts"
+            target.mkdir(parents=True)
+            with patch.object(Path, "home", return_value=home):
+                with self.assertRaisesRegex(RuntimeError, "METADATA_NOT_UNIQUE"):
+                    probe.find_owned_shortcuts_data_container("owned")
+                (target / ".com.apple.mobile_container_manager.metadata.plist").write_bytes(
+                    b"<?xml version='1.0'?><plist>broken-private-structure")
+                with self.assertRaisesRegex(RuntimeError, "METADATA_UNCONFIRMED"):
+                    probe.find_owned_shortcuts_data_container("owned")
+
+    def test_fixture_metadata_has_entry_and_time_budgets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            base = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Data/Application"
+            (base / "one").mkdir(parents=True)
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe.time, "monotonic", side_effect=[0, 6]):
+                with self.assertRaisesRegex(RuntimeError, "METADATA_BUDGET"):
+                    probe.find_owned_shortcuts_data_container("owned")
+            for index in range(256):
+                (base / f"extra-{index}").mkdir()
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe.time, "monotonic", return_value=0):
+                with self.assertRaisesRegex(RuntimeError, "METADATA_LIMIT"):
+                    probe.find_owned_shortcuts_data_container("owned")
+
+    def test_fixture_metadata_refuses_symlink_to_external_container(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            base = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Data/Application"
+            base.mkdir(parents=True)
+            outside = home / "outside"
+            outside.mkdir()
+            (outside / ".com.apple.mobile_container_manager.metadata.plist").write_bytes(
+                plistlib.dumps({"MCMMetadataIdentifier": "com.apple.shortcuts"}))
+            try:
+                probe.os.symlink(outside, base / "alias", target_is_directory=True)
+            except OSError as error:
+                self.skipTest("symlink permission unavailable: " + type(error).__name__)
+            with patch.object(Path, "home", return_value=home):
+                with self.assertRaisesRegex(RuntimeError, "METADATA_SYMLINK"):
+                    probe.find_owned_shortcuts_data_container("owned")
+
+    def test_fixture_metadata_refuses_oversized_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            target = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Data/Application/shortcuts"
+            target.mkdir(parents=True)
+            (target / ".com.apple.mobile_container_manager.metadata.plist").write_bytes(b"x" * 65537)
+            with patch.object(Path, "home", return_value=home):
+                with self.assertRaisesRegex(RuntimeError, "METADATA_TOO_LARGE"):
+                    probe.find_owned_shortcuts_data_container("owned")
+
+    @unittest.skipUnless(hasattr(probe.os, "O_NOFOLLOW"), "O_NOFOLLOW is required on native Mac runner")
+    def test_fixture_metadata_replacement_symlink_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            target = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Data/Application/shortcuts"
+            target.mkdir(parents=True)
+            metadata = target / ".com.apple.mobile_container_manager.metadata.plist"
+            metadata.write_bytes(plistlib.dumps({"MCMMetadataIdentifier": "com.apple.shortcuts"}))
+            outside = home / "external-private-file"
+            outside.write_bytes(b"PRIVATE_SENTINEL_MUST_NOT_BE_READ")
+            original_open = probe.os.open
+
+            def replace_before_open(path, *args, **kwargs):
+                metadata.unlink()
+                probe.os.symlink(outside, metadata)
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe.os, "open", new=replace_before_open):
+                with self.assertRaisesRegex(RuntimeError, "METADATA_UNCONFIRMED"):
+                    probe.find_owned_shortcuts_data_container("owned")
+
+    def test_optional_group_rpc_timeout_preserves_schema_result(self):
+        with patch.object(probe, "command", side_effect=probe.subprocess.TimeoutExpired([], 10)):
+            result = probe.collect_shortcuts_group_metadata("owned")
+        self.assertEqual(result["status"], "GROUP_METADATA_NATIVE_COMMAND_UNCONFIRMED")
+        self.assertFalse(result["group_store_read"])
+
+    def test_group_metadata_requires_help_and_never_retains_external_paths(self):
+        absent_help = probe.subprocess.CompletedProcess([], 0, b"app data", b"")
+        with patch.object(probe, "command", return_value=absent_help) as command:
+            self.assertEqual(probe.collect_shortcuts_group_metadata("owned")["status"],
+                             "GROUPS_NOT_IN_NATIVE_HELP")
+            self.assertEqual(command.call_count, 1)
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "Library/Developer/CoreSimulator/Devices/owned/data").mkdir(parents=True)
+            outside = home / "outside"
+            outside.mkdir()
+            help_result = probe.subprocess.CompletedProcess([], 0, b"app data groups", b"")
+            paths = probe.subprocess.CompletedProcess([], 0,
+                json.dumps({"group.synthetic": str(outside)}).encode(), b"")
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "command", side_effect=[help_result, paths]):
+                result = probe.collect_shortcuts_group_metadata("owned")
+            self.assertEqual(result, {"status": "GROUP_METADATA_UNCONFIRMED"})
+            self.assertNotIn(str(outside), json.dumps(result))
+
+    def test_owned_group_metadata_is_relative_and_reads_no_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            container = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Shared/AppGroup/synthetic"
+            container.mkdir(parents=True)
+            help_result = probe.subprocess.CompletedProcess([], 0, b"app data groups", b"")
+            paths = probe.subprocess.CompletedProcess([], 0,
+                json.dumps({"group.synthetic": str(container)}).encode(), b"")
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "command", side_effect=[help_result, paths]):
+                result = probe.collect_shortcuts_group_metadata("owned")
+            self.assertEqual(result["groups"],
+                             {"group.synthetic": "Containers/Shared/AppGroup/synthetic"})
+            self.assertFalse(result["group_store_read"])
+
+    def test_schema_reader_rejects_container_outside_fresh_device(self):
+        with patch.object(probe, "find_owned_shortcuts_data_container",
+                          side_effect=RuntimeError("OWN_CONTAINER_METADATA_ESCAPE")), \
+                patch.object(probe, "command") as command:
+            with self.assertRaisesRegex(RuntimeError, "OWN_CONTAINER_METADATA_ESCAPE"):
+                probe.survey_native_schema("owned")
+            command.assert_not_called()
+
+    def test_every_collector_failure_has_a_sanitized_code(self):
+        import ast
+        import native_artifact
+        tree = ast.parse(Path(native_artifact.__file__).read_text(encoding="utf-8"))
+        errors = [node.args[0].value for node in ast.walk(tree)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                  and node.func.id == "ShortcutArtifactError"
+                  and node.args and isinstance(node.args[0], ast.Constant)]
+        self.assertTrue(errors)
+        for message in errors:
+            with self.subTest(message=message):
+                error = ("private detail\nnative_artifact.ShortcutArtifactError: " + message).encode()
+                self.assertNotEqual(probe.native_artifact_failure_code(error),
+                                    "COLLECTOR_FAILED_UNKNOWN")
+
+    def test_collection_passes_run_boundary_to_subprocess(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            container = home / "Library/Developer/CoreSimulator/Devices/owned/data/Container"
+            container.mkdir(parents=True)
+            artifacts = home / "artifacts"
+            artifacts.mkdir()
+            (artifacts / "synthetic.shortcut.receipt.json").write_text("{}", encoding="utf-8")
+            resolved = probe.subprocess.CompletedProcess([], 0, str(container).encode(), b"")
+            collected = probe.subprocess.CompletedProcess([], 0, b"", b"")
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "ARTIFACTS", artifacts), \
+                    patch.object(probe, "command", side_effect=[resolved, collected]) as command:
+                self.assertEqual(probe.collect_native_export("owned", 123456789), {})
+            invocation = command.call_args.args[0]
+            self.assertEqual(invocation[-1], "123456789")
+            self.assertIn("not_before_ns=int(sys.argv[3])", invocation[2])
+
+    def test_collector_failure_retains_only_allowlisted_code(self):
+        self.assertEqual(probe.native_artifact_failure_code(
+            b"private diagnostic\nnative_artifact.ShortcutArtifactError: no .shortcut file found in container"),
+            "NO_NATIVE_FILE")
+        self.assertEqual(probe.native_artifact_failure_code(
+            b"private diagnostic\nnative_artifact.ShortcutArtifactError: symlinks are not permitted in container"),
+            "CONTAINER_HAS_SYMLINK")
+        self.assertEqual(probe.native_artifact_failure_code(b"unexpected private diagnostic"),
+                         "COLLECTOR_FAILED_UNKNOWN")
+
+    def test_external_container_never_reaches_collector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            own = home / "Library/Developer/CoreSimulator/Devices/owned/data"
+            own.mkdir(parents=True)
+            outside = home / "outside"
+            outside.mkdir()
+            result = probe.subprocess.CompletedProcess([], 0, str(outside).encode(), b"")
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "command", return_value=result) as command:
+                with self.assertRaisesRegex(RuntimeError, "OUTSIDE_OWN_SIMULATOR"):
+                    probe.collect_native_export("owned", 1)
+                self.assertEqual(command.call_count, 1)
+
+    def test_missing_container_is_sanitized(self):
+        result = probe.subprocess.CompletedProcess([], 0, b"/missing-synthetic-container", b"")
+        with patch.object(probe, "command", return_value=result) as command:
+            with self.assertRaisesRegex(RuntimeError, "NATIVE_EXPORT_CONTAINER_UNCONFIRMED"):
+                probe.collect_native_export("owned", 1)
+            self.assertEqual(command.call_count, 1)
+
+
+class SelectionTests(unittest.TestCase):
+    def setUp(self):
+        timeout_probe = patch.object(probe, "native_timeout_probe", return_value={
+            "wrapper_return_bounded_with_descendant_present": True,
+            "descendant_marker_seen": True, "seconds": 1.0})
+        timeout_probe.start()
+        self.addCleanup(timeout_probe.stop)
+        schema_probe = patch.object(probe, "survey_native_schema", return_value={
+            "scope": "schema_only_no_rows_no_database_copy", "sqlite_files": 0,
+            "condition_payload_proven": False})
+        self.schema_probe = schema_probe.start()
+        self.addCleanup(schema_probe.stop)
+        groups_probe = patch.object(probe, "collect_shortcuts_group_metadata", return_value={
+            "status": "GROUP_PATH_METADATA_ONLY", "groups": {}, "group_store_read": False})
+        groups_probe.start()
+        self.addCleanup(groups_probe.stop)
+        self.runtimes = {"runtimes": [{"isAvailable": True, "version": "27.0",
+                         "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-27-0"}]}
+        self.types = {"devicetypes": [{"name": "iPhone Test", "identifier": "test.iphone",
+                                      "productFamily": "iPhone"}]}
+        self.devices = {"devices": {"com.apple.CoreSimulator.SimRuntime.iOS-27-0": [
+            {"name": "iPhone Test", "isAvailable": True}]}}
+
+    def test_selects_only_existing_compatible_template(self):
+        self.assertEqual(probe.choose_device(self.runtimes, self.devices, self.types),
+                         ("com.apple.CoreSimulator.SimRuntime.iOS-27-0", "test.iphone"))
+
+    def test_unavailable_runtime_rejected(self):
+        self.runtimes["runtimes"][0]["isAvailable"] = False
+        with self.assertRaisesRegex(RuntimeError, "TEMPLATE_ABSENT"):
+            probe.choose_device(self.runtimes, self.devices, self.types)
+
+    def test_older_runtime_not_substituted(self):
+        self.runtimes["runtimes"][0]["version"] = "26.0"
+        with self.assertRaisesRegex(RuntimeError, "TEMPLATE_ABSENT"):
+            probe.choose_device(self.runtimes, self.devices, self.types)
+
+    def test_unknown_device_not_guessed(self):
+        self.types["devicetypes"][0]["name"] = "Different iPhone"
+        with self.assertRaisesRegex(RuntimeError, "TEMPLATE_ABSENT"):
+            probe.choose_device(self.runtimes, self.devices, self.types)
+
+    def test_refuses_non_runner_without_subprocess(self):
+        with patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "false"}), \
+                patch.object(probe, "command") as command:
+            with self.assertRaisesRegex(RuntimeError, "RUNNER_REQUIRED"):
+                probe.main()
+            command.assert_not_called()
+
+    def test_cleanup_timeout_does_not_discard_result(self):
+        with patch.object(probe, "command", side_effect=[
+                probe.subprocess.TimeoutExpired("shutdown", 30),
+                probe.subprocess.CompletedProcess([], 0)]) as command:
+            self.assertEqual(probe.cleanup_device("synthetic-id"),
+                             ["shutdown:cleanup_unconfirmed"])
+            self.assertEqual(command.call_count, 2)
+
+    def test_project_and_scheme_invoked_exist(self):
+        self.assertTrue((probe.ROOT / "AppleSimulatorProbe.xcodeproj").is_dir())
+        self.assertTrue((probe.ROOT / "AppleSimulatorProbe.xcodeproj" / "xcshareddata" /
+                         "xcschemes" / "AppleSimulatorProbe.xcscheme").is_file())
+
+    def test_schema_requires_synthetic_fixture_marker_before_reading_store(self):
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+
+        def fake_command(args, **kwargs):
+            stdout = identifier.encode() if args[1:3] == ["simctl", "create"] else b""
+            return probe.subprocess.CompletedProcess(args, 0, stdout, b"")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ROOT", Path(directory) / "probe"), \
+                patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                patch.object(probe.sys, "platform", "darwin"), \
+                patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch.object(probe, "sim_json", side_effect=[self.runtimes, self.devices, self.types]), \
+                patch.object(probe, "command", side_effect=fake_command), patch("builtins.print"):
+            self.assertEqual(probe.main(), 1)
+            self.schema_probe.assert_not_called()
+            receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+            self.assertEqual(receipt["failure"], "SYNTHETIC_FILTER_STATE_UNCONFIRMED")
+            self.assertFalse(receipt["otp_proven"])
+
+    def test_device_id_preserves_case(self):
+        original = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+        for identifier in (original, original.lower()):
+            self.assertEqual(probe.validated_device_id((identifier + "\n").encode()), identifier)
+
+    def test_device_id_rejects_malformed_and_noncanonical(self):
+        for identifier in (b"", b"not-a-uuid", b"ABCDEF0123456789ABCDEF0123456789",
+                           b"{ABCDEF01-2345-6789-ABCD-EF0123456789}"):
+            with self.subTest(identifier=identifier), self.assertRaises(ValueError):
+                probe.validated_device_id(identifier)
+
+    def test_xcode_destination_gets_original_created_identifier(self):
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+
+        def fake_command(args, **kwargs):
+            stdout = (identifier + "\n").encode() if args[1:3] == ["simctl", "create"] else b""
+            if args[:2] == ["xcodebuild", "test"]:
+                stdout = b"PROBE_SYNTHETIC_FILTER_READY=true\n"
+            if "-showdestinations" in args:
+                return probe.subprocess.CompletedProcess(args, 70, b"Available destinations:\n", b"Synthetic error\n")
+            return probe.subprocess.CompletedProcess(args, 0, stdout, b"")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ROOT", Path(directory) / "probe"), \
+                patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                patch.object(probe.sys, "platform", "darwin"), \
+                patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch.object(probe, "sim_json", side_effect=[
+                    self.runtimes, self.devices, self.types]) as sim_json, \
+                patch.object(probe, "command", side_effect=fake_command) as command, \
+                patch("builtins.print"):
+            self.assertEqual(probe.main(), 0)
+            build_args = next(call.args[0] for call in command.call_args_list
+                              if call.args[0][:2] == ["xcodebuild", "test"])
+            self.assertEqual(build_args[build_args.index("-destination") + 1],
+                             "platform=iOS Simulator,id=" + identifier)
+            calls = [call.args[0] for call in command.call_args_list]
+            destinations = ["xcodebuild", *probe.PROJECT_ARGS, "-showdestinations"]
+            create = next(args for args in calls if args[1:3] == ["simctl", "create"])
+            boot = next(args for args in calls if args[1:3] == ["simctl", "boot"])
+            self.assertLess(calls.index(["xcodebuild", "-showsdks"]), calls.index(create))
+            self.assertLess(calls.index(create), calls.index(destinations))
+            self.assertLess(calls.index(destinations), calls.index(boot))
+            self.assertLess(calls.index(boot), calls.index(build_args))
+            self.assertEqual(sim_json.call_count, 3)
+            self.assertIn("Available destinations:",
+                          (probe.ARTIFACTS / "destinations_preboot.txt").read_text(encoding="utf-8"))
+            receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+            self.assertEqual(receipt["destinations_preboot_diagnostic_exit"], 70)
+            self.assertEqual(receipt["bootstatus_exit"], 0)
+            self.assertFalse(receipt["message_access"])
+            self.assertFalse(receipt["otp_proven"])
+            self.assertEqual(receipt["status"], "NATIVE_STORE_SCHEMA_OBSERVED_ONLY")
+            self.schema_probe.assert_called_once_with(identifier)
+            build_call = next(call for call in command.call_args_list
+                              if call.args[0][:2] == ["xcodebuild", "test"])
+            self.assertEqual(build_call.kwargs["env"]["TEST_RUNNER_SHORTCUTS_PROBE_MODE"], "schema-only")
+            self.assertIsNone(probe.DEADLINE)
+
+    def test_command_timeout_obeys_remaining_budget(self):
+        with patch.object(probe, "DEADLINE", 102), \
+                patch.object(probe.time, "monotonic", return_value=100), \
+                patch.object(probe, "run_with_timeout", return_value=
+                             probe.subprocess.CompletedProcess([], 0)) as run, \
+                patch("builtins.print"):
+            probe.command(["synthetic", "diagnostic"], timeout=60)
+            self.assertEqual(run.call_args.kwargs["timeout"], 2)
+
+    def test_bounded_process_uses_files_and_its_own_session(self):
+        process = MagicMock(pid=4321, returncode=0)
+
+        def launch(args, **kwargs):
+            kwargs["stdout"].write(b"synthetic stdout")
+            kwargs["stderr"].write(b"synthetic stderr")
+            return process
+
+        with patch.object(probe.subprocess, "Popen", side_effect=launch) as popen:
+            result = probe.run_with_timeout(["synthetic"], 2, {"SAFE": "1"})
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"synthetic stdout")
+        self.assertEqual(result.stderr, b"synthetic stderr")
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertNotEqual(popen.call_args.kwargs["stdout"], probe.subprocess.PIPE)
+        process.wait.assert_called_once_with(timeout=2)
+
+    def test_process_timeout_kills_only_owned_group_and_second_wait_is_bounded(self):
+        process = MagicMock(pid=4321, returncode=None)
+        process.wait.side_effect = [probe.subprocess.TimeoutExpired("synthetic", 2),
+                                    probe.subprocess.TimeoutExpired("synthetic", 5)]
+
+        def launch(args, **kwargs):
+            kwargs["stdout"].write(b"PROBE_PARTIAL")
+            return process
+
+        with patch.object(probe.subprocess, "Popen", side_effect=launch), \
+                patch.object(probe.os, "killpg", create=True) as killpg, \
+                patch.object(probe.signal, "SIGKILL", 9, create=True):
+            with self.assertRaises(probe.subprocess.TimeoutExpired) as caught:
+                probe.run_with_timeout(["synthetic"], 2, {})
+            killpg.assert_called_once_with(4321, 9)
+        self.assertEqual(caught.exception.stdout, b"PROBE_PARTIAL")
+        self.assertEqual([call.kwargs["timeout"] for call in process.wait.call_args_list], [2, 5])
+
+    def test_process_exit_race_does_not_turn_timeout_into_success(self):
+        process = MagicMock(pid=4321, returncode=0)
+        process.wait.side_effect = [probe.subprocess.TimeoutExpired("synthetic", 2), 0]
+        with patch.object(probe.subprocess, "Popen", return_value=process), \
+                patch.object(probe.os, "killpg", side_effect=ProcessLookupError, create=True), \
+                patch.object(probe.signal, "SIGKILL", 9, create=True):
+            with self.assertRaises(probe.subprocess.TimeoutExpired):
+                probe.run_with_timeout(["synthetic"], 2, {})
+
+    def test_native_timeout_probe_requires_descendant_marker_and_bounded_duration(self):
+        for output, elapsed, expected in ((b"GRANDCHILD_STARTED", 1.1, True),
+                                           (b"", 1.1, False),
+                                           (b"GRANDCHILD_STARTED", 8.0, False)):
+            with self.subTest(output=output, elapsed=elapsed), \
+                    patch.object(probe.time, "monotonic", side_effect=[100, 100 + elapsed]), \
+                    patch.object(probe, "run_with_timeout", side_effect=
+                                 probe.subprocess.TimeoutExpired([], 1, output=output)):
+                result = NATIVE_TIMEOUT_PROBE()
+                self.assertEqual(result["wrapper_return_bounded_with_descendant_present"], expected)
+
+    def test_native_timeout_probe_rejects_normal_exit(self):
+        with patch.object(probe, "run_with_timeout", return_value=
+                         probe.subprocess.CompletedProcess([], 0, b"GRANDCHILD_STARTED")):
+            result = NATIVE_TIMEOUT_PROBE()
+        self.assertFalse(result["wrapper_return_bounded_with_descendant_present"])
+
+    def test_diagnostic_collection_disabled_only_when_help_lists_flag(self):
+        self.assertEqual(probe.test_diagnostic_options(
+            "Options:\n    -collect-test-diagnostics mode    Collect test diagnostics\n"),
+            ["-collect-test-diagnostics", "never"])
+        for help_text in ("", "unrelated -collect-test-diagnostics mention",
+                          "    -collect-test-diagnostics-invalid option"):
+            self.assertEqual(probe.test_diagnostic_options(help_text), [])
+
+    def test_help_gate_keeps_raw_flag_even_when_artifact_is_truncated(self):
+        output = b"    -collect-test-diagnostics mode\n" + b"x" * 70000
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ARTIFACTS", Path(directory)), \
+                patch.object(probe, "command", return_value=
+                             probe.subprocess.CompletedProcess([], 0, output, b"")):
+            result = probe.collect_xcode_diagnostic({}, "xcode_help", ["xcodebuild", "-help"])
+            self.assertEqual(probe.test_diagnostic_options(
+                (result.stdout + result.stderr).decode()), ["-collect-test-diagnostics", "never"])
+            self.assertEqual(len((probe.ARTIFACTS / "xcode_help.txt").read_text()), 65536)
+
+    def test_ui_timeout_still_attempts_evidence_recovery_without_claiming_pass(self):
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+
+        def fake_command(args, **kwargs):
+            if args[:2] == ["xcodebuild", "test"]:
+                raise probe.subprocess.TimeoutExpired(args, 480, output=b"PROBE_PARTIAL_UI\n")
+            if args[:3] == ["xcrun", "xcresulttool", "export"]:
+                raise probe.subprocess.TimeoutExpired(args, 60)
+            stdout = identifier.encode() if args[1:3] == ["simctl", "create"] else b""
+            return probe.subprocess.CompletedProcess(args, 0, stdout, b"")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ROOT", Path(directory) / "probe"), \
+                patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                patch.object(probe.sys, "platform", "darwin"), \
+                patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch.object(probe, "sim_json", side_effect=[
+                    self.runtimes, self.devices, self.types]), \
+                patch.object(probe, "command", side_effect=fake_command) as command, \
+                patch("builtins.print"):
+            (Path(directory) / "ProbeResults.xcresult").mkdir()
+            self.assertEqual(probe.main(), 1)
+            calls = [call.args[0] for call in command.call_args_list]
+            self.assertTrue(any(args[:3] == ["xcrun", "xcresulttool", "export"] for args in calls))
+            self.assertTrue(any(args[-1].endswith("last-screen.png") for args in calls))
+            receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+            self.assertEqual(receipt["failure"], "UI_TEST_COMMAND_TIMEOUT")
+            self.assertEqual(receipt["attachment_export_exit"], "unconfirmed")
+            self.assertEqual(receipt["last_screenshot_exit"], 0)
+            self.assertFalse(receipt["otp_proven"])
+
+    def test_preflight_timeout_does_not_skip_the_ui_test(self):
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+
+        def fake_command(args, **kwargs):
+            if "-showdestinations" in args:
+                raise probe.subprocess.TimeoutExpired(args, 60, output=b"Partial destinations\n")
+            stdout = identifier.encode() if args[1:3] == ["simctl", "create"] else b""
+            if args[:2] == ["xcodebuild", "test"]:
+                stdout = b"PROBE_SYNTHETIC_FILTER_READY=true\n"
+            return probe.subprocess.CompletedProcess(args, 0, stdout, b"")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ROOT", Path(directory) / "probe"), \
+                patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                patch.object(probe.sys, "platform", "darwin"), \
+                patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch.object(probe, "sim_json", side_effect=[
+                    self.runtimes, self.devices, self.types]), \
+                patch.object(probe, "command", side_effect=fake_command) as command, \
+                patch("builtins.print"):
+            self.assertEqual(probe.main(), 0)
+            self.assertTrue(any(call.args[0][:2] == ["xcodebuild", "test"]
+                                for call in command.call_args_list))
+            receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+            self.assertEqual(receipt["destinations_preboot_diagnostic_exit"], "timeout")
+            self.assertIn("Partial destinations", (probe.ARTIFACTS / "destinations_preboot.txt").read_text())
+
+    def test_expired_budget_does_not_start_another_command(self):
+        with patch.object(probe, "DEADLINE", 99), \
+                patch.object(probe.time, "monotonic", return_value=100), \
+                patch.object(probe, "run_with_timeout") as run:
+            with self.assertRaisesRegex(RuntimeError, "PROBE_BUDGET_EXHAUSTED"):
+                probe.command(["synthetic", "diagnostic"])
+            run.assert_not_called()
+
+    def test_cleanup_retains_its_own_budget(self):
+        with patch.object(probe, "DEADLINE", 99), \
+                patch.object(probe.time, "monotonic", return_value=100), \
+                patch.object(probe, "run_with_timeout", return_value=
+                             probe.subprocess.CompletedProcess([], 0)) as run, \
+                patch("builtins.print"):
+            self.assertEqual(probe.cleanup_device("synthetic-id"), [])
+            self.assertEqual(run.call_count, 2)
+            self.assertTrue(all(call.kwargs["timeout"] == 30 for call in run.call_args_list))
+
+    def test_failure_diagnostics_keep_destination_context_and_redact_paths(self):
+        output = (f"{probe.ROOT.parent}/Probe\nxcodebuild: error: Unable to find a device\n"
+                  "Provided: { id:ABC }\nAvailable destinations:\n{ platform:iOS Simulator }\n"
+                  "/synthetic-home/Library\n")
+        with patch.dict(probe.os.environ, {"HOME": "/synthetic-home"}):
+            result = probe.xcode_diagnostics(output.encode(), failed=True, simulator_id="ABC")
+        self.assertIn("Provided: { id:ABC }", result)
+        self.assertIn("{ platform:iOS Simulator }", result)
+        self.assertIn("<WORKSPACE>/Probe", result)
+        self.assertIn("<HOME>/Library", result)
+        self.assertNotIn("/synthetic-home", result)
+
+    def test_diagnostics_are_bounded_and_success_is_filtered(self):
+        self.assertEqual(len(probe.xcode_diagnostics(b"x" * 70000, failed=True)), 65536)
+        self.assertEqual(probe.xcode_diagnostics(b"noise\nPROBE_OK\n", failed=False), "PROBE_OK")
+
+    def test_diagnostic_ids_preserve_only_our_simulator(self):
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+        text = ("{ id:" + identifier.lower() + " }\n{ id:unrelated-host }\n").encode()
+        result = probe.xcode_diagnostics(text, True, simulator_id=identifier)
+        self.assertIn(identifier.lower(), result)
+        self.assertNotIn("unrelated-host", result)
+        self.assertIn("<OTHER_RUNNER_DESTINATION>", result)
+
+    def test_timeout_preserves_partial_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ARTIFACTS", Path(directory)), \
+                patch.dict(probe.os.environ, {"HOME": "/synthetic-home"}), \
+                patch.object(probe, "command", side_effect=probe.subprocess.TimeoutExpired(
+                    ["xcodebuild", "-showdestinations"], 1,
+                    output=b"Available destinations:\n{ id:unrelated-host }\n",
+                    stderr=b"/synthetic-home/Library\n")):
+            with self.assertRaises(probe.subprocess.TimeoutExpired):
+                probe.diagnostic_command(["xcodebuild", "-showdestinations"], "destinations.txt")
+            result = (probe.ARTIFACTS / "destinations.txt").read_text(encoding="utf-8")
+            self.assertIn("Available destinations:", result)
+            self.assertIn("<HOME>/Library", result)
+            self.assertNotIn("unrelated-host", result)
+
+    def test_timeout_receipt_does_not_serialize_command_paths(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                patch.object(probe.sys, "platform", "darwin"), \
+                patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch.object(probe, "sim_json", side_effect=probe.subprocess.TimeoutExpired(
+                    ["xcodebuild", "test", "-derivedDataPath", "/private-workspace/DerivedData"], 1)), \
+                patch.object(probe, "command", return_value=
+                             probe.subprocess.CompletedProcess([], 0, b"", b"")), \
+                patch("builtins.print"):
+            self.assertEqual(probe.main(), 1)
+            text = (probe.ARTIFACTS / "receipt.json").read_text(encoding="utf-8")
+            self.assertNotIn("private-workspace", text)
+            self.assertEqual(json.loads(text)["failure"], "COMMAND_TIMEOUT")
+
+    def test_normal_macos_session_environment_is_preserved(self):
+        expected = {key: "synthetic" for key in (
+            "USER", "LOGNAME", "SHELL", "XPC_SERVICE_NAME", "__CF_USER_TEXT_ENCODING",
+            "HOME", "PATH", "TMPDIR", "DEVELOPER_DIR")}
+        self.assertEqual(probe.simulator_environment(expected), expected)
+
+    def test_credential_and_injection_values_are_not_read_or_forwarded(self):
+        blocked = (
+            "GITHUB_ACTIONS", "GH_HOST", "ACTIONS_RUNTIME_URL", "RUNNER_TEMP", "CI_DATA",
+            "AWS_REGION", "AZURE_DATA", "ARM_DATA", "GOOGLE_DATA", "GCLOUD_DATA",
+            "CLOUDFLARE_DATA", "MY_TOKEN", "MY_SECRET", "PASSWORD", "PASSWD",
+            "CREDENTIAL", "COOKIE", "AUTH", "API_KEY", "PRIVATE_KEY",
+            "BASH_ENV", "ENV", "CDPATH", "GIT_ASKPASS", "SSH_ASKPASS", "SSH_AUTH_SOCK",
+            "GPG_AGENT_INFO", "PYTHONPATH", "PYTHONHOME", "RUBYOPT", "PERL5OPT",
+            "NODE_OPTIONS", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "GIT_CONFIG_COUNT")
+
+        class ProtectedValues(dict):
+            def __getitem__(self, key):
+                raise AssertionError("A blocked value was accessed")
+
+        self.assertEqual(probe.simulator_environment(ProtectedValues.fromkeys(blocked)), {})
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -21,7 +21,7 @@ jobs:
           persist-credentials: false
       - name: Inspect fresh simulator
         run: |
-          python3 -m unittest discover -s probe -p 'test_native_*.py' -q
+          python3 -m unittest discover -s probe -p 'test_*.py' -q
           python3 probe/inspect_simulator.py
       - name: Preserve synthetic UI evidence
         if: always()

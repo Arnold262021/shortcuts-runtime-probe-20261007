@@ -2,6 +2,8 @@
 
 import json
 import os
+import plistlib
+import stat
 import re
 from pathlib import Path
 import shutil
@@ -11,6 +13,7 @@ import uuid
 import time
 import signal
 import tempfile
+from xml.parsers.expat import ExpatError
 
 
 ROOT = Path(__file__).resolve().parent
@@ -253,7 +256,7 @@ def collect_native_export(device_id, not_before_ns):
 
 
 def survey_native_schema(device_id):
-    container = resolve_shortcuts_container(device_id)
+    container = find_owned_shortcuts_data_container(device_id)
     from native_store_schema import NativeStoreSchemaError, survey_shortcuts_schema
     try:
         survey = survey_shortcuts_schema(container)
@@ -264,7 +267,76 @@ def survey_native_schema(device_id):
             "sqlite_files": len(survey["databases"]), "condition_payload_proven": False}
 
 
+def find_owned_shortcuts_data_container(device_id):
+    # Metadata belongs only to the fresh simulator created by this process.
+    try:
+        own_data = (Path.home() / "Library/Developer/CoreSimulator/Devices" /
+                    device_id / "data").resolve(strict=True)
+        application_root = own_data / "Containers/Data/Application"
+        if application_root.is_symlink():
+            raise RuntimeError("OWN_APPLICATION_ROOT_SYMLINK")
+        application_root = application_root.resolve(strict=True)
+        if not application_root.is_relative_to(own_data):
+            raise RuntimeError("OWN_APPLICATION_ROOT_ESCAPE")
+        matches = []
+        count = 0
+        deadline = time.monotonic() + 5
+        with os.scandir(application_root) as entries:
+            for entry in entries:
+                count += 1
+                if count > 256:
+                    raise RuntimeError("OWN_CONTAINER_METADATA_LIMIT")
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("OWN_CONTAINER_METADATA_BUDGET")
+                if entry.is_symlink():
+                    raise RuntimeError("OWN_CONTAINER_METADATA_SYMLINK")
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                container = Path(entry.path).resolve(strict=True)
+                if not container.is_relative_to(application_root):
+                    raise RuntimeError("OWN_CONTAINER_METADATA_ESCAPE")
+                metadata = container / ".com.apple.mobile_container_manager.metadata.plist"
+                try:
+                    file_stat = metadata.lstat()
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise RuntimeError("OWN_CONTAINER_METADATA_NOT_REGULAR")
+                if file_stat.st_size > 65536:
+                    raise RuntimeError("OWN_CONTAINER_METADATA_TOO_LARGE")
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                with os.fdopen(os.open(metadata, flags), "rb") as source:
+                    opened_stat = os.fstat(source.fileno())
+                    if not stat.S_ISREG(opened_stat.st_mode):
+                        raise RuntimeError("OWN_CONTAINER_METADATA_NOT_REGULAR")
+                    if opened_stat.st_size > 65536:
+                        raise RuntimeError("OWN_CONTAINER_METADATA_TOO_LARGE")
+                    raw = source.read(65537)
+                if len(raw) > 65536:
+                    raise RuntimeError("OWN_CONTAINER_METADATA_TOO_LARGE")
+                content = plistlib.loads(raw)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("OWN_CONTAINER_METADATA_BUDGET")
+                if (isinstance(content, dict) and
+                        content.get("MCMMetadataIdentifier") == "com.apple.shortcuts"):
+                    matches.append(container)
+        if time.monotonic() >= deadline:
+            raise RuntimeError("OWN_CONTAINER_METADATA_BUDGET")
+        if len(matches) != 1:
+            raise RuntimeError("OWN_SHORTCUTS_METADATA_NOT_UNIQUE")
+        return matches[0]
+    except (OSError, ValueError, plistlib.InvalidFileException, ExpatError) as error:
+        raise RuntimeError("OWN_CONTAINER_METADATA_UNCONFIRMED") from error
+
+
 def collect_shortcuts_group_metadata(device_id):
+    try:
+        return _collect_shortcuts_group_metadata(device_id)
+    except (subprocess.TimeoutExpired, RuntimeError):
+        return {"status": "GROUP_METADATA_NATIVE_COMMAND_UNCONFIRMED", "group_store_read": False}
+
+
+def _collect_shortcuts_group_metadata(device_id):
     help_result = command(["xcrun", "simctl", "help", "get_app_container"],
                           timeout=10, check=False)
     help_text = (help_result.stdout + help_result.stderr).decode("utf-8", "replace")
