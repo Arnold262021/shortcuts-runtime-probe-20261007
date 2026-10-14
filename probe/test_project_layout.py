@@ -1,6 +1,9 @@
 from pathlib import Path
 import shutil
+import sys
 import tempfile
+import textwrap
+import types
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +17,297 @@ def workflow_source(root):
 
 
 class ProbeLayoutTests(unittest.TestCase):
+    @staticmethod
+    def _workflow_step(workflow, name, next_name):
+        body = workflow.split(f"- name: {name}", 1)[1]
+        return body.split(f"- name: {next_name}", 1)[0]
+
+    def _assert_focal_step_conditions(self, workflow):
+        broad = self._workflow_step(
+            workflow, "Test generic probe contracts", "Test focal synthetic POSIX contracts")
+        focal = self._workflow_step(
+            workflow, "Test focal synthetic POSIX contracts", "Inspect selected generic lab mode")
+        inspect = self._workflow_step(
+            workflow, "Inspect selected generic lab mode", "Preserve synthetic UI evidence")
+        self.assertIn("if: inputs.probe_mode != 'sdk-posix-fixture-preflight'", broad)
+        self.assertIn("if: inputs.probe_mode == 'sdk-posix-fixture-preflight'", focal)
+        self.assertIn("if: inputs.probe_mode != 'sdk-posix-fixture-preflight'", inspect)
+
+    def _focal_namespace(self):
+        workflow = workflow_source(ROOT).read_text(encoding="utf-8")
+        block = workflow.split("# POSIX_FIXTURE_INLINE_BEGIN", 1)[1]
+        block = block.split("# POSIX_FIXTURE_INLINE_END", 1)[0]
+        namespace = {"__name__": "focal_inline"}
+        exec(textwrap.dedent(block), namespace)
+        return namespace
+
+    def _focal_cases(self, caller, single):
+        module = types.ModuleType("test_sdk_stage_help")
+
+        class FakeCaller(unittest.TestCase):
+            def test_run_stops_after_uncertain_cleanup_and_retains_temporary_root(self):
+                return caller(self)
+
+        class FakeSingle(unittest.TestCase):
+            def test_single_term_ignoring_process_is_drained_after_forced_cleanup(self):
+                return single(self)
+
+        module.SdkStageHelpUnitTests = FakeCaller
+        module.SdkStageHelpPosixEngineTests = FakeSingle
+        return module
+
+    def _decorated_focal_cases(self, kind):
+        module = self._focal_cases(lambda _case: None, lambda _case: None)
+
+        if kind == "expected":
+            def caller(_case):
+                raise AssertionError("PRIVATE_SENTINEL_EXPECTED")
+            module.SdkStageHelpUnitTests.test_run_stops_after_uncertain_cleanup_and_retains_temporary_root = unittest.expectedFailure(caller)
+        elif kind == "unexpected":
+            def caller(_case):
+                return None
+            module.SdkStageHelpUnitTests.test_run_stops_after_uncertain_cleanup_and_retains_temporary_root = unittest.expectedFailure(caller)
+        else:
+            raise AssertionError("unknown decorated fixture")
+        return module
+
+    def _run_focal(self, namespace, module, artifacts):
+        with patch.dict(sys.modules, {"test_sdk_stage_help": module}), \
+                patch.dict(namespace, {"host_supported": lambda: True}), \
+                patch("subprocess.Popen", side_effect=AssertionError("no subprocess")):
+            return namespace["run_focal"](artifacts)
+
+    def test_focal_posix_workflow_selects_exactly_two_cases_and_excludes_other_modes(self) -> None:
+        workflow = workflow_source(ROOT).read_text(encoding="utf-8")
+        self._assert_focal_step_conditions(workflow)
+        self.assertIn("- sdk-posix-fixture-preflight", workflow)
+        focal = workflow.split("# POSIX_FIXTURE_INLINE_BEGIN", 1)[1]
+        focal = focal.split("# POSIX_FIXTURE_INLINE_END", 1)[0]
+        self.assertIn("caller_false_cleanup", focal)
+        self.assertIn("single_forced_cleanup", focal)
+        self.assertIn("test_run_stops_after_uncertain_cleanup_and_retains_temporary_root", focal)
+        self.assertIn("test_single_term_ignoring_process_is_drained_after_forced_cleanup", focal)
+        self.assertNotIn("discover", focal)
+        self.assertNotIn("run_sdk_stage_help", focal)
+        self.assertNotIn("inspect_simulator", focal)
+
+    def test_focal_step_conditions_reject_individual_missing_guards(self) -> None:
+        workflow = workflow_source(ROOT).read_text(encoding="utf-8")
+        conditions = (
+            ("Test generic probe contracts", "if: inputs.probe_mode != 'sdk-posix-fixture-preflight'"),
+            ("Test focal synthetic POSIX contracts", "if: inputs.probe_mode == 'sdk-posix-fixture-preflight'"),
+            ("Inspect selected generic lab mode", "if: inputs.probe_mode != 'sdk-posix-fixture-preflight'"),
+        )
+        for step, condition in conditions:
+            with self.subTest(step=step):
+                start = workflow.index(f"- name: {step}")
+                condition_start = workflow.index(condition, start)
+                mutated = workflow[:condition_start] + workflow[condition_start + len(condition):]
+                with self.assertRaises(AssertionError):
+                    self._assert_focal_step_conditions(mutated)
+
+    def test_focal_guard_prevents_import_and_records_unconfirmed_receipt(self) -> None:
+        namespace = self._focal_namespace()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(namespace, {"host_supported": lambda: False}), \
+                patch.dict(sys.modules, {"test_sdk_stage_help": None}):
+            artifacts = Path(directory) / "artifacts"
+            code, receipt = namespace["run_focal"](artifacts)
+            stored = (artifacts / "posix-fixture-receipt.json").read_text(encoding="utf-8")
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt["status"], "POSIX_FIXTURE_UNCONFIRMED")
+        self.assertFalse(receipt["guard_confirmed"])
+        self.assertEqual(receipt["tests_run"], 0)
+        self.assertEqual(receipt["outcomes"], {
+            "caller_false_cleanup": "not_run", "single_forced_cleanup": "not_run"})
+        self.assertNotIn("test_sdk_stage_help", stored)
+
+    def test_focal_host_guard_requires_darwin_posix_and_literal_github_true(self) -> None:
+        namespace = self._focal_namespace()
+        host = namespace["host_supported"]
+        runtime_sys = namespace["sys"]
+        runtime_os = namespace["os"]
+        cases = (
+            ("darwin", "posix", "true", True),
+            ("darwin", "posix", "false", False),
+            ("darwin", "posix", None, False),
+            ("linux", "posix", "true", False),
+            ("darwin", "nt", "true", False),
+            ("win32", "nt", "true", False),
+        )
+        for platform, name, actions, expected in cases:
+            with self.subTest(platform=platform, name=name, actions=actions), \
+                    patch.object(runtime_sys, "platform", platform), \
+                    patch.object(runtime_os, "name", name), \
+                    patch.dict(runtime_os.environ, {}, clear=True):
+                if actions is not None:
+                    runtime_os.environ["GITHUB_ACTIONS"] = actions
+                self.assertIs(host(), expected)
+
+    def test_focal_import_error_with_true_guard_stops_before_single_and_sanitizes_stored_json(self) -> None:
+        namespace = self._focal_namespace()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(namespace, {"host_supported": lambda: True}), \
+                patch.dict(sys.modules, {"test_sdk_stage_help": None}):
+            artifacts = Path(directory) / "artifacts"
+            code, receipt = namespace["run_focal"](artifacts)
+            stored = (artifacts / "posix-fixture-receipt.json").read_text(encoding="utf-8")
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt["status"], "POSIX_FIXTURE_UNCONFIRMED")
+        self.assertTrue(receipt["guard_confirmed"])
+        self.assertEqual(receipt["tests_run"], 0)
+        self.assertEqual(receipt["outcomes"]["single_forced_cleanup"], "not_run")
+        self.assertNotIn("test_sdk_stage_help", stored)
+        self.assertNotIn("Traceback", stored)
+
+    def test_focal_passes_only_when_both_frozen_cases_pass_without_processes(self) -> None:
+        namespace = self._focal_namespace()
+        module = self._focal_cases(lambda _case: None, lambda _case: None)
+        with tempfile.TemporaryDirectory() as directory:
+            code, receipt = self._run_focal(namespace, module, Path(directory) / "artifacts")
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt["status"], "POSIX_FIXTURE_ASSERTIONS_PASSED_ONLY")
+        self.assertTrue(receipt["guard_confirmed"])
+        self.assertEqual(receipt["tests_run"], 2)
+        self.assertEqual(receipt["counts"], {
+            "failures": 0, "errors": 0, "skipped": 0, "subtest_failures": 0,
+            "expected_failures": 0, "unexpected_successes": 0, "unknown_callbacks": 0})
+        self.assertEqual(receipt["outcomes"], {
+            "caller_false_cleanup": "passed", "single_forced_cleanup": "passed"})
+        self.assertFalse(receipt["broad_suite_run"])
+        self.assertFalse(receipt["inspector_run"])
+        self.assertFalse(receipt["sdk_help_commands_run"])
+
+    def test_focal_first_red_stops_single_and_sanitizes_callback_failures(self) -> None:
+        callbacks = {
+            "failure": lambda case: case.fail("PRIVATE_SENTINEL_FAILURE"),
+            "error": lambda _case: (_ for _ in ()).throw(RuntimeError("PRIVATE_SENTINEL_ERROR")),
+            "skip": lambda case: case.skipTest("PRIVATE_SENTINEL_SKIP"),
+            "subtest": lambda case: self._failing_subtest(case),
+        }
+        for name, caller in callbacks.items():
+            with self.subTest(callback=name), tempfile.TemporaryDirectory() as directory:
+                namespace = self._focal_namespace()
+                ran_single = []
+                module = self._focal_cases(caller, lambda _case: ran_single.append(True))
+                code, receipt = self._run_focal(namespace, module, Path(directory) / "artifacts")
+                stored = (Path(directory) / "artifacts" / "posix-fixture-receipt.json").read_text(encoding="utf-8")
+                self.assertEqual(code, 1)
+                self.assertEqual(receipt["tests_run"], 1)
+                self.assertEqual(receipt["outcomes"]["single_forced_cleanup"], "not_run")
+                self.assertFalse(ran_single)
+                self.assertNotIn("PRIVATE_SENTINEL", str(receipt))
+                self.assertNotIn("PRIVATE_SENTINEL", stored)
+
+        for name in ("expected", "unexpected"):
+            with self.subTest(callback=name), tempfile.TemporaryDirectory() as directory:
+                namespace = self._focal_namespace()
+                module = self._decorated_focal_cases(name)
+                code, receipt = self._run_focal(namespace, module, Path(directory) / "artifacts")
+                stored = (Path(directory) / "artifacts" / "posix-fixture-receipt.json").read_text(encoding="utf-8")
+                self.assertEqual(code, 1)
+                self.assertEqual(receipt["tests_run"], 1)
+                self.assertEqual(receipt["outcomes"]["single_forced_cleanup"], "not_run")
+                self.assertNotIn("PRIVATE_SENTINEL", str(receipt))
+                self.assertNotIn("PRIVATE_SENTINEL", stored)
+
+    @staticmethod
+    def _failing_subtest(case):
+        with case.subTest("PRIVATE_SENTINEL_SUBTEST"):
+            case.fail("PRIVATE_SENTINEL_SUBTEST")
+
+    def test_focal_result_rejects_unknown_callbacks_and_invalid_counts(self) -> None:
+        namespace = self._focal_namespace()
+        case_one = unittest.FunctionTestCase(lambda: None)
+        case_two = unittest.FunctionTestCase(lambda: None)
+        unknown = unittest.FunctionTestCase(lambda: None)
+        result = namespace["SanitizedResult"]((case_one, case_two))
+        result.startTest(unknown)
+        _, passed = result.snapshot()
+        self.assertFalse(passed)
+        self.assertEqual(result.counts["unknown_callbacks"], 1)
+        for callback in (
+                lambda value: value.stopTest(unknown),
+                lambda value: value.addDuration(unknown, 1.0),
+                lambda value: value.addSubTest(case_one, object(), "not-an-exception")):
+            result = namespace["SanitizedResult"]((case_one, case_two))
+            callback(result)
+            _, passed = result.snapshot()
+            self.assertFalse(passed)
+            self.assertGreater(result.counts["unknown_callbacks"], 0)
+        for invalid in (False, float("nan"), -1, 33):
+            result = namespace["SanitizedResult"]((case_one, case_two))
+            result.testsRun = 2
+            result.outcomes = {"caller_false_cleanup": "passed", "single_forced_cleanup": "passed"}
+            result.counts["errors"] = invalid
+            snapshot, passed = result.snapshot()
+            self.assertFalse(passed)
+            self.assertEqual(snapshot["counts"]["errors"], 0)
+        result = namespace["SanitizedResult"]((case_one, case_two))
+        result.testsRun = 1
+        result.outcomes = {"caller_false_cleanup": "passed", "single_forced_cleanup": "passed"}
+        _, passed = result.snapshot()
+        self.assertFalse(passed)
+        result = namespace["SanitizedResult"]((case_one, case_two))
+        result.testsRun = 2
+        result.outcomes["caller_false_cleanup"] = True
+        snapshot, passed = result.snapshot()
+        self.assertFalse(passed)
+        self.assertEqual(snapshot["outcomes"]["caller_false_cleanup"], "not_run")
+
+    def test_focal_callback_precedence_never_allows_late_success_to_clear_a_red_result(self) -> None:
+        namespace = self._focal_namespace()
+        case_one = unittest.FunctionTestCase(lambda: None)
+        case_two = unittest.FunctionTestCase(lambda: None)
+        for callback, expected, count in (
+                ("addFailure", "failed", "failures"),
+                ("addError", "error", "errors")):
+            with self.subTest(callback=callback):
+                result = namespace["SanitizedResult"]((case_one, case_two))
+                result.startTest(case_one)
+                getattr(result, callback)(case_one, (AssertionError, AssertionError("PRIVATE_SENTINEL"), None))
+                result.addSuccess(case_one)
+                result.startTest(case_two)
+                result.addSuccess(case_two)
+                snapshot, passed = result.snapshot()
+                self.assertFalse(passed)
+                self.assertEqual(snapshot["tests_run"], 2)
+                self.assertEqual(snapshot["outcomes"]["caller_false_cleanup"], expected)
+                self.assertEqual(snapshot["outcomes"]["single_forced_cleanup"], "passed")
+                self.assertEqual(snapshot["counts"][count], 1)
+                self.assertNotIn("PRIVATE_SENTINEL", str(snapshot))
+
+    def test_focal_receipt_write_error_returns_unconfirmed_without_private_error_text(self) -> None:
+        namespace = self._focal_namespace()
+        module = self._focal_cases(lambda _case: None, lambda _case: None)
+        original_open = Path.open
+
+        def deny_receipt(path, *args, **kwargs):
+            if path.name == "posix-fixture-receipt.json":
+                raise OSError("PRIVATE_SENTINEL_WRITE")
+            return original_open(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(Path, "open", autospec=True, side_effect=deny_receipt):
+            code, receipt = self._run_focal(namespace, module, Path(directory) / "artifacts")
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt["status"], "POSIX_FIXTURE_UNCONFIRMED")
+        self.assertNotIn("PRIVATE_SENTINEL", str(receipt))
+
+    def test_focal_refuses_to_overwrite_existing_artifact_directory(self) -> None:
+        namespace = self._focal_namespace()
+        module = self._focal_cases(lambda _case: None, lambda _case: None)
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = Path(directory) / "artifacts"
+            artifacts.mkdir()
+            marker = artifacts / "preexisting-marker"
+            marker.write_text("preserve", encoding="utf-8")
+            code, receipt = self._run_focal(namespace, module, artifacts)
+            self.assertTrue(marker.is_file())
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt["status"], "POSIX_FIXTURE_UNCONFIRMED")
+        self.assertEqual(receipt["tests_run"], 0)
+
     def test_workflow_contract_also_runs_in_the_published_layout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "probe"
@@ -21,7 +315,7 @@ class ProbeLayoutTests(unittest.TestCase):
             published = root.parent / ".github/workflows/shortcuts-simulator.yml"
             published.parent.mkdir(parents=True)
             shutil.copyfile(workflow_source(ROOT), published)
-            with patch(__name__ + ".ROOT", root):
+            with patch.object(sys.modules[__name__], "ROOT", root):
                 self.test_workflow_exposes_only_bounded_lab_modes()
 
     def test_workflow_exposes_only_bounded_lab_modes(self) -> None:

@@ -19,6 +19,7 @@ name: Shortcuts Simulator Inspection
           - appium-prebuilt-session-preflight
           - wda-launch-preflight
           - sdk-help-preflight
+          - sdk-posix-fixture-preflight
 
 permissions:
   contents: read
@@ -37,8 +38,165 @@ jobs:
         with:
           persist-credentials: false
       - name: Test generic probe contracts
+        if: inputs.probe_mode != 'sdk-posix-fixture-preflight'
         run: python3 -m unittest discover -s probe -p 'test_*.py' -q
+      - name: Test focal synthetic POSIX contracts
+        if: inputs.probe_mode == 'sdk-posix-fixture-preflight'
+        working-directory: probe
+        run: |
+          python3 - <<'PY'
+          # POSIX_FIXTURE_INLINE_BEGIN
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import unittest
+
+          ALIASES = ('caller_false_cleanup', 'single_forced_cleanup')
+          COUNT_KEYS = ('failures', 'errors', 'skipped', 'subtest_failures',
+                        'expected_failures', 'unexpected_successes', 'unknown_callbacks')
+          RANK = {'not_run': 0, 'passed': 1, 'skipped': 2, 'failed': 3, 'error': 4}
+
+          def host_supported():
+              return sys.platform == 'darwin' and os.name == 'posix' and os.environ.get('GITHUB_ACTIONS') == 'true'
+
+          class SanitizedResult(unittest.TestResult):
+              def __init__(self, cases):
+                  super().__init__()
+                  self.cases = tuple(cases)
+                  self.counts = {key: 0 for key in COUNT_KEYS}
+                  self.outcomes = {alias: 'not_run' for alias in ALIASES}
+
+              def _alias(self, test):
+                  for case, alias in zip(self.cases, ALIASES):
+                      if test is case:
+                          return alias
+                  return None
+
+              def _record(self, test, outcome, count=None):
+                  alias = self._alias(test)
+                  if alias is None:
+                      self.counts['unknown_callbacks'] += 1
+                      self.stop()
+                      return
+                  if count is not None:
+                      self.counts[count] += 1
+                      self.stop()
+                  if RANK[outcome] > RANK[self.outcomes[alias]]:
+                      self.outcomes[alias] = outcome
+
+              def startTest(self, test):
+                  if self._alias(test) is None:
+                      self.counts['unknown_callbacks'] += 1
+                      self.stop()
+                  else:
+                      self.testsRun += 1
+
+              def stopTest(self, test):
+                  if self._alias(test) is None:
+                      self._record(test, 'error')
+
+              def addSuccess(self, test):
+                  self._record(test, 'passed')
+
+              def addFailure(self, test, err):
+                  self._record(test, 'failed', 'failures')
+
+              def addError(self, test, err):
+                  self._record(test, 'error', 'errors')
+
+              def addSkip(self, test, reason):
+                  self._record(test, 'skipped', 'skipped')
+
+              def addExpectedFailure(self, test, err):
+                  self._record(test, 'failed', 'expected_failures')
+
+              def addUnexpectedSuccess(self, test):
+                  self._record(test, 'failed', 'unexpected_successes')
+
+              def addDuration(self, test, elapsed):
+                  if self._alias(test) is None:
+                      self._record(test, 'error')
+
+              def addSubTest(self, test, subtest, outcome):
+                  if outcome is None:
+                      if self._alias(test) is None:
+                          self._record(test, 'error')
+                      return
+                  if (not isinstance(outcome, tuple) or len(outcome) != 3
+                          or not isinstance(outcome[0], type)):
+                      self.counts['unknown_callbacks'] += 1
+                      self.stop()
+                      return
+                  self.counts['subtest_failures'] += 1
+                  kind = 'failed' if issubclass(outcome[0], AssertionError) else 'error'
+                  self._record(test, kind, 'failures' if kind == 'failed' else 'errors')
+
+              def snapshot(self):
+                  valid = type(self.testsRun) is int and 0 <= self.testsRun <= 2
+                  count_values = {}
+                  outcome_values = {}
+                  for key in COUNT_KEYS:
+                      value = self.counts.get(key)
+                      good = type(value) is int and 0 <= value <= 32
+                      valid = valid and good
+                      count_values[key] = value if good else 0
+                  for alias in ALIASES:
+                      value = self.outcomes.get(alias)
+                      good = isinstance(value, str) and value in RANK
+                      valid = valid and good
+                      outcome_values[alias] = value if good else 'not_run'
+                  clean = {'tests_run': self.testsRun if type(self.testsRun) is int and 0 <= self.testsRun <= 2 else 0,
+                           'counts': count_values, 'outcomes': outcome_values}
+                  passed = (valid and clean['tests_run'] == 2
+                            and not any(count_values.values())
+                            and all(value == 'passed' for value in outcome_values.values()))
+                  return clean, passed
+
+          def run_focal(artifacts):
+              receipt = {'scope': 'owned_synthetic_posix_contracts',
+                         'status': 'POSIX_FIXTURE_UNCONFIRMED', 'guard_confirmed': False,
+                         'tests_run': 0, 'counts': {key: 0 for key in COUNT_KEYS},
+                         'outcomes': {alias: 'not_run' for alias in ALIASES},
+                         'broad_suite_run': False, 'inspector_run': False,
+                         'sdk_help_commands_run': False}
+              owned = False
+              passed = False
+              try:
+                  artifacts.mkdir(exist_ok=False)
+                  owned = True
+                  if host_supported() is True:
+                      receipt['guard_confirmed'] = True
+                      from test_sdk_stage_help import SdkStageHelpUnitTests, SdkStageHelpPosixEngineTests
+                      cases = (
+                          SdkStageHelpUnitTests('test_run_stops_after_uncertain_cleanup_and_retains_temporary_root'),
+                          SdkStageHelpPosixEngineTests('test_single_term_ignoring_process_is_drained_after_forced_cleanup'))
+                      result = SanitizedResult(cases)
+                      unittest.TestSuite(cases).run(result)
+                      clean, passed = result.snapshot()
+                      receipt.update(clean)
+                      if passed:
+                          receipt['status'] = 'POSIX_FIXTURE_ASSERTIONS_PASSED_ONLY'
+              except Exception:
+                  passed = False
+                  receipt['status'] = 'POSIX_FIXTURE_UNCONFIRMED'
+              finally:
+                  if owned:
+                      try:
+                          with (artifacts / 'posix-fixture-receipt.json').open('x', encoding='utf-8') as stream:
+                              json.dump(receipt, stream, sort_keys=True)
+                      except Exception:
+                          passed = False
+                          receipt['status'] = 'POSIX_FIXTURE_UNCONFIRMED'
+              return (0 if passed else 1), receipt
+
+          if __name__ == '__main__':
+              code, _receipt = run_focal(Path.cwd().parent / 'artifacts')
+              raise SystemExit(code)
+          # POSIX_FIXTURE_INLINE_END
+          PY
       - name: Inspect selected generic lab mode
+        if: inputs.probe_mode != 'sdk-posix-fixture-preflight'
         env:
           SHORTCUTS_PROBE_EXECUTION_MODE: ${{ inputs.probe_mode }}
         run: |

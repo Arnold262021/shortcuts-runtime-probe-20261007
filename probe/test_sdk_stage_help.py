@@ -12,6 +12,36 @@ from types import SimpleNamespace
 import sdk_stage_help as sdk
 
 
+SYNTHETIC_CHILD_TAIL = (
+    "import subprocess,sys,time; "
+    "subprocess.Popen([sys.executable,'-c',\"import time; time.sleep(.2); print('spawn rest')\"]); "
+    "print('spawn first'); sys.stdout.flush()"
+)
+SYNTHETIC_ORPHAN_CHILD = (
+    "import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "os.write({control_fd}, b'READY'); time.sleep(60)"
+)
+SYNTHETIC_SINGLE_TERM_IGNORING = (
+    "import signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "print('spawn READY'); sys.stdout.flush(); time.sleep(60)"
+)
+
+
+def synthetic_orphan_source():
+    return f"""import os,select,subprocess,sys
+r, w = os.pipe()
+child = ({SYNTHETIC_ORPHAN_CHILD!r}).format(control_fd=w)
+subprocess.Popen([sys.executable, '-c', child], pass_fds=(w,))
+os.close(w)
+ready, _, _ = select.select([r], [], [], 2)
+data = os.read(r, 6) if ready else b''
+os.close(r)
+if data != b'READY':
+    raise SystemExit(23)
+print('spawn parent-exits')
+sys.stdout.flush()
+"""
+
 class SdkStageHelpUnitTests(unittest.TestCase):
     def _bounded_read(self, values):
         def read(_fd, requested):
@@ -64,6 +94,15 @@ class SdkStageHelpUnitTests(unittest.TestCase):
         self.assertEqual(over, {"bytes": sdk.STREAM_LIMIT + 1, "complete": False})
         self.assertNotIn("sha256", over)
         self.assertNotIn("literal_counts", over)
+
+    def test_synthetic_posix_scripts_compile_on_all_hosts(self):
+        for name, source in (
+                ("child-tail", SYNTHETIC_CHILD_TAIL),
+                ("orphan-child", SYNTHETIC_ORPHAN_CHILD.format(control_fd=3)),
+                ("orphan-parent", synthetic_orphan_source()),
+                ("single-term-ignoring", SYNTHETIC_SINGLE_TERM_IGNORING)):
+            with self.subTest(name=name):
+                compile(source, "<synthetic-sdk-help>", "exec")
 
     def test_diagnostic_discards_bad_types_scalars_and_private_fields(self):
         source = {
@@ -199,39 +238,46 @@ class SdkStageHelpUnitTests(unittest.TestCase):
             self.assertIn("sha256", complete["stdout"])
             cleanup.assert_called_once_with(process)
 
-            process, out_key, err_key = process_and_selector()
-            selector = mock.Mock()
-            selector.select.side_effect = [[(out_key, None), (err_key, None)], [(out_key, None)]]
-            with mock.patch.object(sdk.subprocess, "Popen", return_value=process), \
-                    mock.patch.object(sdk.selectors, "DefaultSelector", return_value=selector), \
-                    mock.patch.object(sdk.os, "set_blocking"), \
-                    mock.patch.object(sdk.os, "read", side_effect=self._bounded_read([b"spawn", b"", b""])), \
-                    mock.patch.object(sdk.time, "monotonic", side_effect=[0, 0, 0, 3, 3, 4, 5, 6]), \
-                    mock.patch.object(sdk, "_cleanup_wda_launch", return_value=True):
-                forced = sdk._capture_help(sdk.HELP_COMMANDS["simctl_spawn_help"], {}, root)
-            self.assertTrue(forced["forced_cleanup"])
-            self.assertTrue(forced["eof_confirmed"])
-            self.assertEqual(forced["status"], "capture_failed")
-            self.assertFalse(forced["stdout"]["complete"])
-            self.assertNotIn("sha256", forced["stdout"])
+            for cleanup_result in (True, False):
+                with self.subTest(cleanup_result=cleanup_result):
+                    process, out_key, err_key = process_and_selector()
+                    selector = mock.Mock()
+                    selector.select.side_effect = [[(out_key, None), (err_key, None)], [(out_key, None)]]
+                    with mock.patch.object(sdk.subprocess, "Popen", return_value=process), \
+                            mock.patch.object(sdk.selectors, "DefaultSelector", return_value=selector), \
+                            mock.patch.object(sdk.os, "set_blocking"), \
+                            mock.patch.object(sdk.os, "read", side_effect=self._bounded_read([b"spawn", b"", b""])), \
+                            mock.patch.object(sdk.time, "monotonic", side_effect=[0, 0, 0, 3, 3, 4, 5, 6]), \
+                            mock.patch.object(sdk, "_cleanup_wda_launch", return_value=cleanup_result):
+                        forced = sdk._capture_help(sdk.HELP_COMMANDS["simctl_spawn_help"], {}, root)
+                    self.assertTrue(forced["forced_cleanup"])
+                    self.assertIs(forced["process_group_drained"], cleanup_result)
+                    self.assertIsInstance(forced["eof_confirmed"], bool)
+                    self.assertEqual(forced["status"], "capture_failed")
+                    for stream in ("stdout", "stderr"):
+                        self.assertFalse(forced[stream]["complete"])
+                        self.assertNotIn("sha256", forced[stream])
 
     def test_run_stops_after_uncertain_cleanup_and_retains_temporary_root(self):
-        incomplete = {"status": "capture_failed", "process_group_drained": False,
-                      "eof_confirmed": False, "stdout": {"bytes": 0, "complete": False},
-                      "stderr": {"bytes": 0, "complete": False}}
         with tempfile.TemporaryDirectory() as directory:
-            owned = Path(directory) / "appium-host-preflight-sdk-help-owned"
-            owned.mkdir()
-            with mock.patch.object(sdk, "_supported_host", return_value=True), \
-                    mock.patch.object(sdk.tempfile, "mkdtemp", return_value=str(owned)), \
-                    mock.patch.object(sdk, "_capture_help", return_value=incomplete) as capture, \
-                    mock.patch.object(sdk, "_remove_owned_root") as remove:
-                result = sdk.run_sdk_stage_help({})
-        self.assertEqual(capture.call_count, 1)
-        self.assertEqual(set(result["queries"]), {"simctl_spawn_help"})
-        self.assertFalse(result["cleanup_exited"])
-        self.assertFalse(result["temporary_cleanup_confirmed"])
-        remove.assert_not_called()
+            for eof_confirmed in (False, True):
+                with self.subTest(eof_confirmed=eof_confirmed):
+                    incomplete = {"status": "capture_failed", "process_group_drained": False,
+                                  "eof_confirmed": eof_confirmed,
+                                  "stdout": {"bytes": 0, "complete": False},
+                                  "stderr": {"bytes": 0, "complete": False}}
+                    owned = Path(directory) / f"appium-host-preflight-sdk-help-owned-{eof_confirmed}"
+                    owned.mkdir()
+                    with mock.patch.object(sdk, "_supported_host", return_value=True), \
+                            mock.patch.object(sdk.tempfile, "mkdtemp", return_value=str(owned)), \
+                            mock.patch.object(sdk, "_capture_help", return_value=incomplete) as capture, \
+                            mock.patch.object(sdk, "_remove_owned_root") as remove:
+                        result = sdk.run_sdk_stage_help({})
+                    self.assertEqual(capture.call_count, 1)
+                    self.assertEqual(set(result["queries"]), {"simctl_spawn_help"})
+                    self.assertFalse(result["cleanup_exited"])
+                    self.assertFalse(result["temporary_cleanup_confirmed"])
+                    remove.assert_not_called()
 
     def test_run_popen_not_started_stops_but_can_remove_owned_temporary_root(self):
         not_started = {"status": "capture_failed", "process_started": False,
@@ -301,10 +347,7 @@ class SdkStageHelpPosixEngineTests(unittest.TestCase):
         self.assertEqual(timed["status"], "timeout")
         self.assertTrue(timed["process_group_drained"])
 
-        completed_child = ("import subprocess,sys,time; "
-                 "subprocess.Popen([sys.executable,'-c',\"import time; time.sleep(.2); print('spawn rest')\"]); "
-                 "print('spawn first'); sys.stdout.flush()")
-        scripts = {argv: completed_child if argv[-1] == "spawn" else "print(%r)" % argv[-1]
+        scripts = {argv: SYNTHETIC_CHILD_TAIL if argv[-1] == "spawn" else "print(%r)" % argv[-1]
                    for argv in sdk.HELP_COMMANDS.values()}
         complete = self._capture(scripts)
         self.assertEqual(complete["status"], "observed")
@@ -312,15 +355,29 @@ class SdkStageHelpPosixEngineTests(unittest.TestCase):
         self.assertTrue(complete["eof_confirmed"])
         self.assertIn("sha256", complete["stdout"])
 
-        child = ("import subprocess,sys,time,signal; "
-                 "subprocess.Popen([sys.executable,'-c',\"import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)\"]); "
-                 "print('spawn parent-exits'); sys.stdout.flush()")
-        scripts = {argv: child if argv[-1] == "spawn" else "print(%r)" % argv[-1]
+        scripts = {argv: synthetic_orphan_source() if argv[-1] == "spawn" else "print(%r)" % argv[-1]
                    for argv in sdk.HELP_COMMANDS.values()}
         result = self._capture(scripts)
-        self.assertTrue(result["process_group_drained"])
-        self.assertTrue(result["eof_confirmed"])
         self.assertTrue(result["forced_cleanup"])
         self.assertEqual(result["status"], "capture_failed")
-        self.assertFalse(result["stdout"]["complete"])
-        self.assertNotIn("sha256", result["stdout"])
+        self.assertIsInstance(result["process_group_drained"], bool)
+        self.assertIsInstance(result["eof_confirmed"], bool)
+        self.assertEqual(result["stdout"]["bytes"], len(b"spawn parent-exits\n"))
+        for stream in ("stdout", "stderr"):
+            self.assertFalse(result[stream]["complete"])
+            self.assertNotIn("sha256", result[stream])
+
+    def test_single_term_ignoring_process_is_drained_after_forced_cleanup(self):
+        scripts = {argv: SYNTHETIC_SINGLE_TERM_IGNORING if argv[-1] == "spawn"
+                   else "print(%r)" % argv[-1] for argv in sdk.HELP_COMMANDS.values()}
+        result = self._capture(scripts, timeout=0.3)
+        self.assertTrue(result["timed_out"])
+        self.assertTrue(result["forced_cleanup"])
+        self.assertTrue(result["process_group_drained"])
+        self.assertTrue(result["eof_confirmed"])
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["stdout"]["bytes"], len(b"spawn READY\n"))
+        self.assertEqual(result["topic_literal_count"], 1)
+        for stream in ("stdout", "stderr"):
+            self.assertFalse(result[stream]["complete"])
+            self.assertNotIn("sha256", result[stream])
