@@ -6,6 +6,21 @@ ROOT = Path(__file__).parent
 
 
 class ProbeLayoutTests(unittest.TestCase):
+    def test_local_fixture_persistence_never_runs_or_exports(self) -> None:
+        source = (ROOT / "AppleSimulatorProbeUITests" / "ShortcutsObservationTests.swift").read_text(encoding="utf-8")
+        self.assertIn('guard requireEmptySyntheticLibrary(in: shortcuts)', source)
+        self.assertIn('application.navigationBars.buttons.matching(identifier: "BackButton")', source)
+        self.assertIn('"No Shortcuts"', source)
+        self.assertIn('guard empty.count == 0, library.cells.count > 0', source)
+        self.assertIn('application.terminate()', source)
+        self.assertIn('application.launch()', source)
+        self.assertIn('PROBE_SYNTHETIC_LIBRARY_NONEMPTY_AFTER_RELAUNCH=true', source)
+        persistence = source.split('private func persistSyntheticFixtureWithoutRunning', 1)[1]
+        persistence = persistence.split('private func selectObservedFileFormat', 1)[0]
+        self.assertNotIn('"Run"', persistence)
+        self.assertNotIn('"Share"', persistence)
+        self.assertNotIn('"Save to Files"', persistence)
+
     def test_active_schema_trial_never_repeats_blocked_export(self) -> None:
         source = (ROOT / "AppleSimulatorProbeUITests" / "ShortcutsObservationTests.swift").read_text(encoding="utf-8")
         method = source.split("func testCreateSyntheticMessageFilterWithoutRunningOrExporting()", 1)[1]

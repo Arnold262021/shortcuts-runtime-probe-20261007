@@ -259,7 +259,7 @@ def survey_native_schema(device_id):
     container = find_owned_shortcuts_data_container(device_id)
     from native_store_schema import NativeStoreSchemaError, survey_shortcuts_schema
     try:
-        survey = survey_shortcuts_schema(container)
+        survey = survey_shortcuts_schema(container, include_inventory=True)
     except NativeStoreSchemaError as error:
         raise RuntimeError("NATIVE_STORE_SCHEMA_UNCONFIRMED:" + str(error)) from error
     (ARTIFACTS / "native-store-schema.json").write_text(json.dumps(survey, indent=2), encoding="utf-8")
@@ -428,9 +428,14 @@ def _collect_shortcuts_group_metadata(device_id):
         # Only app-associated paths, validated under this fresh simulator, reach SQLite.
         surveys = []
         failed = 0
+        excluded = 0
+        workflow_groups = {"group.is.workflow.shortcuts", "group.is.workflow.my.app", "group.com.apple.shortcuts"}
         for identifier, path in resolved_groups:
+            if identifier == "group.com.apple.tipsnext":
+                excluded += 1
+                continue
             try:
-                survey = survey_shortcuts_schema(path)
+                survey = survey_shortcuts_schema(path, include_inventory=identifier in workflow_groups)
             except NativeStoreSchemaError as error:
                 survey = {"status": str(error), "schema_only": True}
                 failed += 1
@@ -440,7 +445,8 @@ def _collect_shortcuts_group_metadata(device_id):
             json.dumps({"scope": "schema_only_no_rows_no_database_copy", "groups": surveys}, indent=2),
             encoding="utf-8")
         return {"status": "GROUP_STORE_SCHEMA_ONLY" if not failed else "GROUP_STORE_SCHEMA_PARTIAL_UNCONFIRMED",
-                "groups": len(surveys), "surveyed_ok": len(surveys) - failed, "failed": failed,
+                "groups": len(surveys), "associated_groups": len(resolved_groups), "excluded_group_roles": excluded,
+                "surveyed_ok": len(surveys) - failed, "failed": failed,
                 "group_schema_read": not failed, "group_rows_read": False,
                 "database_copy": False, "condition_payload_proven": False}
     except NativeGroupMetadataError as error:
@@ -534,6 +540,10 @@ def main():
         receipt["status"] = "UI_TEST_PASSED_ONLY"
         if "PROBE_SYNTHETIC_FILTER_READY=true" not in diagnostics:
             raise RuntimeError("SYNTHETIC_FILTER_STATE_UNCONFIRMED")
+        receipt["synthetic_library_nonempty_after_relaunch_observed"] = (
+            "PROBE_SYNTHETIC_LIBRARY_NONEMPTY_AFTER_RELAUNCH=true" in diagnostics)
+        if not receipt["synthetic_library_nonempty_after_relaunch_observed"]:
+            raise RuntimeError("SYNTHETIC_LIBRARY_PERSISTENCE_UNCONFIRMED")
         receipt["native_store_schema"] = survey_native_schema(device_id)
         receipt["shortcuts_group_metadata"] = collect_shortcuts_group_metadata(device_id)
         receipt["status"] = "NATIVE_STORE_SCHEMA_OBSERVED_ONLY"

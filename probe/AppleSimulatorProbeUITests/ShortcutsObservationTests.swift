@@ -18,6 +18,7 @@ final class ShortcutsObservationTests: XCTestCase {
 
         capture(shortcuts, stage: "initial")
         guard dismissShortcutsOnboardingIfPresent(in: shortcuts) else { return }
+        guard requireEmptySyntheticLibrary(in: shortcuts) else { return }
         guard tapUnique(
             shortcuts.buttons.matching(identifier: "main.button.newshortcut"),
             in: shortcuts,
@@ -44,7 +45,54 @@ final class ShortcutsObservationTests: XCTestCase {
             stage: "finish-filter-editing"
         ) else { return }
         print("PROBE_SYNTHETIC_FILTER_READY=true")
+        guard persistSyntheticFixtureWithoutRunning(in: shortcuts) else { return }
         print("PROBE_NO_SHORTCUT_RUN_INVOKED=true")
+    }
+
+    @MainActor
+    private func requireEmptySyntheticLibrary(in application: XCUIApplication) -> Bool {
+        let libraries = application.otherElements.matching(identifier: "all_shortcuts_library")
+        guard libraries.element(boundBy: 0).waitForExistence(timeout: stageTimeout), libraries.count == 1 else {
+            return block(at: "fixture-empty-library", in: application, reason: "expected-one-library")
+        }
+        let empty = libraries.element(boundBy: 0).staticTexts.matching(NSPredicate(format: "label == %@", "No Shortcuts"))
+        guard empty.count == 1 else {
+            return block(at: "fixture-empty-library", in: application, reason: "fresh-empty-library-not-confirmed")
+        }
+        print("PROBE_FRESH_LIBRARY_EMPTY=true")
+        return true
+    }
+
+    @MainActor
+    private func requireNonemptySyntheticLibrary(in application: XCUIApplication, stage: String) -> Bool {
+        let libraries = application.otherElements.matching(identifier: "all_shortcuts_library")
+        guard libraries.element(boundBy: 0).waitForExistence(timeout: stageTimeout), libraries.count == 1 else {
+            return block(at: stage, in: application, reason: "expected-one-library")
+        }
+        let library = libraries.element(boundBy: 0)
+        let empty = library.staticTexts.matching(NSPredicate(format: "label == %@", "No Shortcuts"))
+        guard empty.count == 0, library.cells.count > 0 else {
+            return block(at: stage, in: application, reason: "fixture-library-still-empty")
+        }
+        capture(application, stage: stage)
+        return true
+    }
+
+    @MainActor
+    private func persistSyntheticFixtureWithoutRunning(in application: XCUIApplication) -> Bool {
+        let back = application.navigationBars.buttons.matching(identifier: "BackButton")
+            .matching(NSPredicate(format: "label == %@", "Back"))
+        guard tapUnique(back, in: application, stage: "fixture-local-save-back") else { return false }
+        guard requireNonemptySyntheticLibrary(in: application, stage: "fixture-library-after-save") else { return false }
+        print("PROBE_SYNTHETIC_LIBRARY_NONEMPTY=true")
+        application.terminate()
+        application.launch()
+        guard application.wait(for: .runningForeground, timeout: launchTimeout) else {
+            return block(at: "fixture-library-after-relaunch", in: application, reason: "synthetic-relaunch-failed")
+        }
+        guard requireNonemptySyntheticLibrary(in: application, stage: "fixture-library-after-relaunch") else { return false }
+        print("PROBE_SYNTHETIC_LIBRARY_NONEMPTY_AFTER_RELAUNCH=true")
+        return true
     }
 
     @MainActor

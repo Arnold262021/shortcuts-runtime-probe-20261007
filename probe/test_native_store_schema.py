@@ -86,11 +86,46 @@ class NativeStoreSchemaTests(unittest.TestCase):
     def test_skips_non_sqlite_extensions_without_reading_them_as_databases(self) -> None:
         temporary, root = self.make_root()
         self.addCleanup(temporary.cleanup)
-        (root / "notes.txt").write_bytes(PRIVATE_SENTINEL.encode("utf-8"))
+        notes = root / "notes.txt"
+        notes.write_bytes(PRIVATE_SENTINEL.encode("utf-8"))
+        original_open = Path.open
 
-        report = survey_shortcuts_schema(root)
+        def reject_non_sqlite_open(path: Path, *args: object, **kwargs: object):
+            if path == notes:
+                raise AssertionError("inventory must not open non-SQLite files")
+            return original_open(path, *args, **kwargs)
 
-        self.assertEqual({"schema_only": True, "candidate_count": 0, "databases": []}, report)
+        with mock.patch.object(Path, "open", new=reject_non_sqlite_open):
+            report = survey_shortcuts_schema(root, include_inventory=True)
+
+        self.assertEqual(True, report["schema_only"])
+        self.assertEqual(0, report["candidate_count"])
+        self.assertEqual([], report["databases"])
+        self.assertEqual(
+            [{"path": "notes.txt", "size": len(PRIVATE_SENTINEL), "suffix": ".txt"}],
+            report["file_inventory"],
+        )
+        self.assertNotIn(PRIVATE_SENTINEL, repr(report))
+
+    def test_rejects_inventory_larger_than_bounded_metadata_limit(self) -> None:
+        temporary, root = self.make_root()
+        self.addCleanup(temporary.cleanup)
+        for index in range(257):
+            (root / f"metadata-{index}.cache").touch()
+
+        with self.assertRaisesRegex(NativeStoreSchemaError, "FILE_INVENTORY_LIMIT"):
+            survey_shortcuts_schema(root, include_inventory=True)
+
+    def test_default_survey_omits_inventory_and_ignores_inventory_limit(self) -> None:
+        temporary, root = self.make_root()
+        self.addCleanup(temporary.cleanup)
+        (root / "excluded.cache").write_bytes(PRIVATE_SENTINEL.encode())
+
+        with mock.patch("native_store_schema.MAX_FILE_INVENTORY_ENTRIES", 0):
+            report = survey_shortcuts_schema(root)
+
+        self.assertNotIn("file_inventory", report)
+        self.assertNotIn(PRIVATE_SENTINEL, repr(report))
 
     def test_rejects_sqlite_file_over_size_limit(self) -> None:
         temporary, root = self.make_root()
@@ -138,7 +173,8 @@ class NativeStoreSchemaTests(unittest.TestCase):
 
         # Keep the clock fixed: this falsifier proves the node bound wins even
         # on a slower host, rather than accidentally consuming the time budget.
-        with mock.patch("native_store_schema.time.monotonic", return_value=0.0):
+        with mock.patch("native_store_schema.MAX_FILE_INVENTORY_ENTRIES", 10_001), \
+                mock.patch("native_store_schema.time.monotonic", return_value=0.0):
             with self.assertRaisesRegex(NativeStoreSchemaError, "CONTAINER_NODE_LIMIT"):
                 survey_shortcuts_schema(root)
 

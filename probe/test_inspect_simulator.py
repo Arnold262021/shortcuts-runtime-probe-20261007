@@ -177,7 +177,7 @@ class ExportBoundaryTests(unittest.TestCase):
             self.assertEqual(result["groups"], 1)
             self.assertFalse(result["group_rows_read"])
             self.assertFalse(result["database_copy"])
-            survey.assert_called_once_with(container.resolve())
+            survey.assert_called_once_with(container.resolve(), include_inventory=False)
             retained = (home / "native-group-store-schema.json").read_text(encoding="utf-8")
             self.assertIn("Containers/Shared/AppGroup/synthetic", retained)
             self.assertNotIn(str(home), retained)
@@ -190,7 +190,7 @@ class ExportBoundaryTests(unittest.TestCase):
             container = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Shared/AppGroup/synthetic"
             container.mkdir(parents=True)
             responses = [probe.subprocess.CompletedProcess([], 0, b"app data groups", b""),
-                         probe.subprocess.CompletedProcess([], 0, b"group.synthetic", b""),
+                         probe.subprocess.CompletedProcess([], 0, b"group.com.apple.shortcuts", b""),
                          probe.subprocess.CompletedProcess([], 0, str(container).encode(), b"")]
             with patch.object(Path, "home", return_value=home), \
                     patch.object(probe, "ARTIFACTS", home), \
@@ -199,8 +199,33 @@ class ExportBoundaryTests(unittest.TestCase):
                     patch.object(probe, "command", side_effect=responses) as command:
                 result = probe.collect_shortcuts_group_metadata("owned")
             self.assertEqual(result["status"], "GROUP_STORE_SCHEMA_ONLY")
-            self.assertEqual(command.call_args_list[-1].args[0][-1], "group.synthetic")
-            survey.assert_called_once_with(container.resolve())
+            self.assertEqual(command.call_args_list[-1].args[0][-1], "group.com.apple.shortcuts")
+            survey.assert_called_once_with(container.resolve(), include_inventory=True)
+
+    def test_tips_group_is_not_surveyed_and_workflow_inventory_is_opt_in(self):
+        import native_store_schema
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            group_root = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Shared/AppGroup"
+            workflow, tips = group_root / "workflow", group_root / "tips"
+            workflow.mkdir(parents=True)
+            tips.mkdir()
+            responses = [probe.subprocess.CompletedProcess([], 0, b"app data groups", b""),
+                         probe.subprocess.CompletedProcess([], 0, b'["group.com.apple.shortcuts", "group.com.apple.tipsnext"]', b""),
+                         probe.subprocess.CompletedProcess([], 0, str(workflow).encode(), b""),
+                         probe.subprocess.CompletedProcess([], 0, str(tips).encode(), b"")]
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "ARTIFACTS", home), \
+                    patch.object(native_store_schema, "survey_shortcuts_schema",
+                                 return_value={"databases": [], "schema_only": True, "file_inventory": []}) as survey, \
+                    patch.object(probe, "command", side_effect=responses):
+                result = probe.collect_shortcuts_group_metadata("owned")
+            survey.assert_called_once_with(workflow.resolve(), include_inventory=True)
+            self.assertEqual(result["excluded_group_roles"], 1)
+            self.assertEqual(result["associated_groups"], 2)
+            self.assertEqual(result["groups"], 1)
+            retained = (home / "native-group-store-schema.json").read_text(encoding="utf-8")
+            self.assertNotIn("tips", retained)
 
     def test_unknown_group_format_is_retained_sanitized_without_store_access(self):
         import native_store_schema
@@ -430,6 +455,29 @@ class SelectionTests(unittest.TestCase):
         for identifier in (original, original.lower()):
             self.assertEqual(probe.validated_device_id((identifier + "\n").encode()), identifier)
 
+    def test_schema_requires_relaunched_library_witness_not_just_ui_green(self):
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+
+        def fake_command(args, **kwargs):
+            stdout = identifier.encode() if args[1:3] == ["simctl", "create"] else b""
+            if args[:2] == ["xcodebuild", "test"]:
+                stdout = b"PROBE_SYNTHETIC_FILTER_READY=true\n"
+            return probe.subprocess.CompletedProcess(args, 0, stdout, b"")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ROOT", Path(directory) / "probe"), \
+                patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                patch.object(probe.sys, "platform", "darwin"), \
+                patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch.object(probe, "sim_json", side_effect=[self.runtimes, self.devices, self.types]), \
+                patch.object(probe, "command", side_effect=fake_command), patch("builtins.print"):
+            self.assertEqual(probe.main(), 1)
+            self.schema_probe.assert_not_called()
+            receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+            self.assertEqual(receipt["failure"], "SYNTHETIC_LIBRARY_PERSISTENCE_UNCONFIRMED")
+            self.assertFalse(receipt["synthetic_library_nonempty_after_relaunch_observed"])
+            self.assertFalse(receipt["otp_proven"])
+
     def test_device_id_rejects_malformed_and_noncanonical(self):
         for identifier in (b"", b"not-a-uuid", b"ABCDEF0123456789ABCDEF0123456789",
                            b"{ABCDEF01-2345-6789-ABCD-EF0123456789}"):
@@ -442,7 +490,7 @@ class SelectionTests(unittest.TestCase):
         def fake_command(args, **kwargs):
             stdout = (identifier + "\n").encode() if args[1:3] == ["simctl", "create"] else b""
             if args[:2] == ["xcodebuild", "test"]:
-                stdout = b"PROBE_SYNTHETIC_FILTER_READY=true\n"
+                stdout = b"PROBE_SYNTHETIC_FILTER_READY=true\nPROBE_SYNTHETIC_LIBRARY_NONEMPTY_AFTER_RELAUNCH=true\n"
             if "-showdestinations" in args:
                 return probe.subprocess.CompletedProcess(args, 70, b"Available destinations:\n", b"Synthetic error\n")
             return probe.subprocess.CompletedProcess(args, 0, stdout, b"")
@@ -612,7 +660,7 @@ class SelectionTests(unittest.TestCase):
                 raise probe.subprocess.TimeoutExpired(args, 60, output=b"Partial destinations\n")
             stdout = identifier.encode() if args[1:3] == ["simctl", "create"] else b""
             if args[:2] == ["xcodebuild", "test"]:
-                stdout = b"PROBE_SYNTHETIC_FILTER_READY=true\n"
+                stdout = b"PROBE_SYNTHETIC_FILTER_READY=true\nPROBE_SYNTHETIC_LIBRARY_NONEMPTY_AFTER_RELAUNCH=true\n"
             return probe.subprocess.CompletedProcess(args, 0, stdout, b"")
 
         with tempfile.TemporaryDirectory() as directory, \

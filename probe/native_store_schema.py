@@ -19,6 +19,7 @@ from urllib.parse import quote
 MAX_CONTAINER_NODES = 10_000
 MAX_SQLITE_CANDIDATES = 8
 MAX_SQLITE_BYTES = 64 * 1024 * 1024
+MAX_FILE_INVENTORY_ENTRIES = 256
 MAX_SCHEMA_OBJECTS = 200
 MAX_COLUMNS_PER_OBJECT = 200
 MAX_IDENTIFIER_BYTES = 128
@@ -36,6 +37,7 @@ _ERROR_CODES = frozenset(
         "CONTAINER_ESCAPE",
         "CONTAINER_UNREADABLE",
         "SQLITE_CANDIDATE_LIMIT",
+        "FILE_INVENTORY_LIMIT",
         "SQLITE_FILE_SIZE_LIMIT",
         "SQLITE_OPEN_FAILED",
         "SQLITE_SCHEMA_QUERY_FAILED",
@@ -120,16 +122,33 @@ def _walk_regular_files(root: Path, deadline: float) -> Iterator[Path]:
             raise NativeStoreSchemaError("CONTAINER_UNREADABLE") from error
 
 
-def _sqlite_candidates(root: Path, deadline: float) -> list[Path]:
+def _collect_file_inventory_and_sqlite_candidates(
+    root: Path, deadline: float, include_inventory: bool
+) -> tuple[list[dict[str, object]] | None, list[Path]]:
+    inventory: list[dict[str, object]] | None = [] if include_inventory else None
     candidates: list[Path] = []
     for path in _walk_regular_files(root, deadline):
         _ensure_deadline(deadline)
-        if path.suffix.lower() not in SQLITE_SUFFIXES:
-            continue
         try:
             file_size = path.stat().st_size
         except OSError as error:
             raise NativeStoreSchemaError("CONTAINER_UNREADABLE") from error
+        if inventory is not None:
+            try:
+                relative_path = path.relative_to(root).as_posix()
+            except ValueError as error:
+                raise NativeStoreSchemaError("CONTAINER_ESCAPE") from error
+            inventory.append(
+                {
+                    "path": relative_path,
+                    "size": file_size,
+                    "suffix": path.suffix.lower(),
+                }
+            )
+            if len(inventory) > MAX_FILE_INVENTORY_ENTRIES:
+                raise NativeStoreSchemaError("FILE_INVENTORY_LIMIT")
+        if path.suffix.lower() not in SQLITE_SUFFIXES:
+            continue
         if file_size > MAX_SQLITE_BYTES:
             raise NativeStoreSchemaError("SQLITE_FILE_SIZE_LIMIT")
         try:
@@ -141,7 +160,7 @@ def _sqlite_candidates(root: Path, deadline: float) -> list[Path]:
         candidates.append(path)
         if len(candidates) > MAX_SQLITE_CANDIDATES:
             raise NativeStoreSchemaError("SQLITE_CANDIDATE_LIMIT")
-    return candidates
+    return inventory, candidates
 
 
 def _require_identifier(value: object) -> str:
@@ -251,7 +270,7 @@ def _survey_database(path: Path, root: Path, deadline: float) -> dict[str, objec
     return {"path": relative_path, "objects": report_objects}
 
 
-def survey_shortcuts_schema(container_root: Path) -> dict[str, object]:
+def survey_shortcuts_schema(container_root: Path, *, include_inventory: bool = False) -> dict[str, object]:
     """Return bounded SQLite schema metadata from a caller-validated container.
 
     The result exposes database-relative paths, tables/views, and column
@@ -261,10 +280,15 @@ def survey_shortcuts_schema(container_root: Path) -> dict[str, object]:
     deadline = time.monotonic() + SCHEMA_DEADLINE_SECONDS
     root = _resolve_root(container_root)
     _ensure_deadline(deadline)
-    databases = _sqlite_candidates(root, deadline)
+    file_inventory, databases = _collect_file_inventory_and_sqlite_candidates(
+        root, deadline, include_inventory
+    )
     reports = [_survey_database(path, root, deadline) for path in databases]
-    return {
+    report: dict[str, object] = {
         "schema_only": True,
         "candidate_count": len(reports),
         "databases": reports,
     }
+    if file_inventory is not None:
+        report["file_inventory"] = file_inventory
+    return report
