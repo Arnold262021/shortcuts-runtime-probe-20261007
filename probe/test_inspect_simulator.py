@@ -20,9 +20,9 @@ class OpenHandleBoundaryTests(unittest.TestCase):
             inside.touch()
             outside = home / "SENTINEL_PRIVATE_DO_NOT_RETAIN.db"
             outside.touch()
-            lsof = f"p123\ncShortcuts\nn{outside}\n"
+            lsof = f"p123\ncShortcuts\nf3u\nn{outside}\n"
             if internal_path:
-                lsof += f"n{inside}\n"
+                lsof += f"f4u\nn{inside}\n"
             results = [probe.subprocess.CompletedProcess([], 0, b"not retained bundle path", b""),
                        probe.subprocess.CompletedProcess([], 0, b"com.apple.shortcuts: 123\n", b""),
                        probe.subprocess.CompletedProcess([], lsof_exit, lsof.encode(), b"PRIVATE_STDERR_SENTINEL"),
@@ -35,6 +35,14 @@ class OpenHandleBoundaryTests(unittest.TestCase):
                 result = probe.collect_native_open_files("owned")
             artifact = home / "native-open-file-paths.json"
             metadata = artifact.read_text() if artifact.exists() else None
+            shape_file = home / "native-shortcuts-lsof-shape.json"
+            if shape_file.exists():
+                shape = shape_file.read_text()
+                self.assertNotIn("SENTINEL", shape)
+                self.assertNotIn("observed.db", shape)
+                self.assertFalse(json.loads(shape)["shortcuts_association_proven"])
+            if last_pid != 123:
+                self.assertFalse(shape_file.exists())
             return result, metadata, command.call_args_list
 
     def test_only_own_relative_paths_survive_stable_native_process(self):

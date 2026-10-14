@@ -91,6 +91,18 @@ class NativeOpenFilesTests(unittest.TestCase):
         self.assertEqual({"pid": 42, "command": "Shortcuts", "open_paths": ["Library/state file"]}, report)
         self.assertNotIn("PRIVATE_SENTINEL", repr(report))
 
+    def test_accepts_valid_fd_metadata_after_process_and_command(self) -> None:
+        temporary, root = self.make_root()
+        self.addCleanup(temporary.cleanup)
+        path = root / "Library" / "state"
+        path.parent.mkdir()
+        path.write_text("fixture")
+
+        report = parse_lsof_metadata(f"p42\ncShortcuts\nf3u\nn{path}\n".encode(), 42, root)
+
+        self.assertEqual(["Library/state"], report["open_paths"])
+        self.assertNotIn("3u", repr(report))
+
     def test_ignores_outside_paths_without_claiming_association(self) -> None:
         temporary, root = self.make_root()
         self.addCleanup(temporary.cleanup)
@@ -128,7 +140,11 @@ class NativeOpenFilesTests(unittest.TestCase):
             f"p43\ncShortcuts\nn{good}\n".encode(),
             f"p42\ncOther\nn{good}\n".encode(),
             f"cShortcuts\np42\nn{good}\n".encode(),
+            f"f3u\np42\ncShortcuts\nn{good}\n".encode(),
             f"n{good}\np42\ncShortcuts\n".encode(),
+            f"p42\ncShortcuts\nf\nn{good}\n".encode(),
+            f"p42\ncShortcuts\nf\x01\nn{good}\n".encode(),
+            f"p42\ncShortcuts\nf{'a' * 33}\nn{good}\n".encode(),
             f"p42\ncShortcuts\nn{good}".encode(),
             b"p42\ncShortcuts\nn/a\x00b\n",
             b"xunknown\n",

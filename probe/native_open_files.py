@@ -224,6 +224,15 @@ def parse_lsof_metadata(stdout: bytes, expected_pid: int, own_data: Path) -> dic
             if observed_pid is None or observed_command is not None or value != SHORTCUTS_COMMAND:
                 raise NativeOpenFilesError("LSOF_COMMAND_UNCONFIRMED")
             observed_command = value
+        elif field == "f":
+            if observed_pid is None or observed_command is None:
+                raise NativeOpenFilesError("LSOF_FORMAT_UNCONFIRMED")
+            # `lsof -Ff` describes an FD token. It is validated only so the
+            # observed record framing stays strict; it is not retained.
+            if not 0 < len(value) <= 32 or not value.isascii() or any(
+                ord(character) < 32 or ord(character) > 126 for character in value
+            ):
+                raise NativeOpenFilesError("LSOF_FORMAT_UNCONFIRMED")
         elif field == "n":
             if observed_pid is None or observed_command is None:
                 raise NativeOpenFilesError("LSOF_FORMAT_UNCONFIRMED")

@@ -417,7 +417,7 @@ def collect_native_entitlement_metadata(device_id):
 
 
 def collect_native_open_files(device_id):
-    from native_open_files import NativeOpenFilesError, parse_simctl_launch, parse_lsof_metadata
+    from native_open_files import NativeOpenFilesError, parse_simctl_launch, parse_lsof_metadata, lsof_output_shape
 
     closed = {"open_handle_contents_read": False, "database_copy": False,
               "condition_payload_proven": False}
@@ -443,6 +443,11 @@ def collect_native_open_files(device_id):
         last = command(launch_args, timeout=15, check=False)
         if last.returncode or parse_simctl_launch(last.stdout) != pid:
             return {**closed, "status": "OPEN_HANDLE_PID_UNSTABLE"}
+        shape = lsof_output_shape(opened.stdout)
+        shape.update(scope="own_app_cli_field_shape_only", process_identity_stable=True,
+                     shortcuts_association_proven=False)
+        (ARTIFACTS / "native-shortcuts-lsof-shape.json").write_text(
+            json.dumps(shape, indent=2), encoding="utf-8")
         try:
             parsed = parse_lsof_metadata(opened.stdout, pid, own_data)
             metadata = {"status": "OPEN_HANDLE_PATH_METADATA_OBSERVED",
