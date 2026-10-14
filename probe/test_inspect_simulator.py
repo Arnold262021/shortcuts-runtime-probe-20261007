@@ -147,30 +147,128 @@ class ExportBoundaryTests(unittest.TestCase):
             home = Path(directory)
             (home / "Library/Developer/CoreSimulator/Devices/owned/data").mkdir(parents=True)
             outside = home / "outside"
+            (home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Shared/AppGroup").mkdir(parents=True)
             outside.mkdir()
             help_result = probe.subprocess.CompletedProcess([], 0, b"app data groups", b"")
             paths = probe.subprocess.CompletedProcess([], 0,
-                json.dumps({"group.synthetic": str(outside)}).encode(), b"")
+                json.dumps([str(outside)]).encode(), b"")
             with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "ARTIFACTS", home), \
                     patch.object(probe, "command", side_effect=[help_result, paths]):
                 result = probe.collect_shortcuts_group_metadata("owned")
-            self.assertEqual(result, {"status": "GROUP_METADATA_UNCONFIRMED"})
+            self.assertEqual(result, {"status": "GROUP_METADATA_PATH_ESCAPE", "group_store_read": False})
             self.assertNotIn(str(outside), json.dumps(result))
 
-    def test_owned_group_metadata_is_relative_and_reads_no_store(self):
+    def test_owned_group_metadata_is_relative_and_reads_only_schema(self):
+        import native_store_schema
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             container = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Shared/AppGroup/synthetic"
             container.mkdir(parents=True)
             help_result = probe.subprocess.CompletedProcess([], 0, b"app data groups", b"")
             paths = probe.subprocess.CompletedProcess([], 0,
-                json.dumps({"group.synthetic": str(container)}).encode(), b"")
+                json.dumps([str(container)]).encode(), b"")
             with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "ARTIFACTS", home), \
+                    patch.object(native_store_schema, "survey_shortcuts_schema",
+                                 return_value={"databases": [], "schema_only": True}) as survey, \
                     patch.object(probe, "command", side_effect=[help_result, paths]):
                 result = probe.collect_shortcuts_group_metadata("owned")
-            self.assertEqual(result["groups"],
-                             {"group.synthetic": "Containers/Shared/AppGroup/synthetic"})
-            self.assertFalse(result["group_store_read"])
+            self.assertEqual(result["groups"], 1)
+            self.assertFalse(result["group_rows_read"])
+            self.assertFalse(result["database_copy"])
+            survey.assert_called_once_with(container.resolve())
+            retained = (home / "native-group-store-schema.json").read_text(encoding="utf-8")
+            self.assertIn("Containers/Shared/AppGroup/synthetic", retained)
+            self.assertNotIn(str(home), retained)
+            self.assertNotIn(str(home), (home / "native-groups-shape.json").read_text(encoding="utf-8"))
+
+    def test_declared_group_identifier_is_resolved_only_by_native_api(self):
+        import native_store_schema
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            container = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Shared/AppGroup/synthetic"
+            container.mkdir(parents=True)
+            responses = [probe.subprocess.CompletedProcess([], 0, b"app data groups", b""),
+                         probe.subprocess.CompletedProcess([], 0, b"group.synthetic", b""),
+                         probe.subprocess.CompletedProcess([], 0, str(container).encode(), b"")]
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "ARTIFACTS", home), \
+                    patch.object(native_store_schema, "survey_shortcuts_schema",
+                                 return_value={"databases": [], "schema_only": True}) as survey, \
+                    patch.object(probe, "command", side_effect=responses) as command:
+                result = probe.collect_shortcuts_group_metadata("owned")
+            self.assertEqual(result["status"], "GROUP_STORE_SCHEMA_ONLY")
+            self.assertEqual(command.call_args_list[-1].args[0][-1], "group.synthetic")
+            survey.assert_called_once_with(container.resolve())
+
+    def test_unknown_group_format_is_retained_sanitized_without_store_access(self):
+        import native_store_schema
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "Library/Developer/CoreSimulator/Devices/owned/data").mkdir(parents=True)
+            unknown = json.dumps({"unknown": str(home / "private")}).encode()
+            responses = [probe.subprocess.CompletedProcess([], 0, b"app data groups", b""),
+                         probe.subprocess.CompletedProcess([], 0, unknown, b"")]
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "ARTIFACTS", home), \
+                    patch.object(native_store_schema, "survey_shortcuts_schema") as survey, \
+                    patch.object(probe, "command", side_effect=responses):
+                result = probe.collect_shortcuts_group_metadata("owned")
+            self.assertEqual(result["status"], "GROUP_METADATA_SHAPE_UNCONFIRMED")
+            survey.assert_not_called()
+            retained = (home / "native-groups-shape.json").read_text(encoding="utf-8")
+            self.assertNotIn(str(home), retained)
+            self.assertNotIn("unknown", retained)
+            self.assertIn("absolute_path", retained)
+
+    def test_group_shape_never_retains_unknown_text_or_paths(self):
+        for raw in (b"PRIVATE_SENTINEL_NOT_A_PATH", b"group.synthetic: /private/SENTINEL", 
+                    b'{"PRIVATE_SENTINEL": "PRIVATE_VALUE"}'):
+            retained = json.dumps(probe.native_group_output_shape(raw))
+            self.assertNotIn("PRIVATE", retained)
+            self.assertNotIn("SENTINEL", retained)
+            self.assertNotIn("synthetic", retained)
+
+    def test_group_schema_failure_is_not_reported_as_observed(self):
+        import native_store_schema
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            container = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Shared/AppGroup/synthetic"
+            container.mkdir(parents=True)
+            responses = [probe.subprocess.CompletedProcess([], 0, b"app data groups", b""),
+                         probe.subprocess.CompletedProcess([], 0, json.dumps([str(container)]).encode(), b"")]
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "ARTIFACTS", home), \
+                    patch.object(native_store_schema, "survey_shortcuts_schema",
+                                 side_effect=native_store_schema.NativeStoreSchemaError("CONTAINER_UNREADABLE")), \
+                    patch.object(probe, "command", side_effect=responses):
+                result = probe.collect_shortcuts_group_metadata("owned")
+            self.assertEqual(result["status"], "GROUP_STORE_SCHEMA_PARTIAL_UNCONFIRMED")
+            self.assertEqual(result["surveyed_ok"], 0)
+            self.assertEqual(result["failed"], 1)
+            self.assertFalse(result["group_schema_read"])
+
+    def test_mixed_group_surveys_are_partial_not_all_observed(self):
+        import native_store_schema
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            group_root = home / "Library/Developer/CoreSimulator/Devices/owned/data/Containers/Shared/AppGroup"
+            containers = [group_root / "one", group_root / "two"]
+            for container in containers:
+                container.mkdir(parents=True)
+            responses = [probe.subprocess.CompletedProcess([], 0, b"app data groups", b""),
+                         probe.subprocess.CompletedProcess([], 0, json.dumps([str(path) for path in containers]).encode(), b"")]
+            with patch.object(Path, "home", return_value=home), \
+                    patch.object(probe, "ARTIFACTS", home), \
+                    patch.object(native_store_schema, "survey_shortcuts_schema", side_effect=[
+                        {"databases": [], "schema_only": True},
+                        native_store_schema.NativeStoreSchemaError("CONTAINER_UNREADABLE")]), \
+                    patch.object(probe, "command", side_effect=responses):
+                result = probe.collect_shortcuts_group_metadata("owned")
+            self.assertEqual(result["status"], "GROUP_STORE_SCHEMA_PARTIAL_UNCONFIRMED")
+            self.assertEqual((result["surveyed_ok"], result["failed"]), (1, 1))
+            self.assertFalse(result["group_schema_read"])
 
     def test_schema_reader_rejects_container_outside_fresh_device(self):
         with patch.object(probe, "find_owned_shortcuts_data_container",

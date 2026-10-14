@@ -336,7 +336,57 @@ def collect_shortcuts_group_metadata(device_id):
         return {"status": "GROUP_METADATA_NATIVE_COMMAND_UNCONFIRMED", "group_store_read": False}
 
 
+def native_group_output_shape(raw):
+    diagnostic = {"trimmed_bytes": len(raw)}
+    if len(raw) > 65536:
+        return {**diagnostic, "format": "oversize"}
+    try:
+        text = raw.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return {**diagnostic, "format": "non_utf8"}
+
+    def kind(value):
+        if isinstance(value, str):
+            if re.fullmatch(r"group\.[A-Za-z0-9._-]{1,122}", value):
+                return "group_identifier"
+            if Path(value).is_absolute():
+                return "absolute_path"
+            return "string_other"
+        return type(value).__name__
+
+    decoded = None
+    format_name = "plain_text"
+    try:
+        decoded = json.loads(text)
+        format_name = "json"
+    except ValueError:
+        try:
+            decoded = plistlib.loads(raw)
+            format_name = "plist"
+        except (plistlib.InvalidFileException, ValueError, TypeError, ExpatError):
+            pass
+    diagnostic["format"] = format_name
+    diagnostic["shape"] = kind(decoded)
+    if isinstance(decoded, dict):
+        diagnostic["count"] = len(decoded)
+        diagnostic["entry_kinds"] = [
+            {"key": kind(key), "value": kind(value)} for key, value in list(decoded.items())[:8]]
+    elif isinstance(decoded, list):
+        diagnostic["count"] = len(decoded)
+        diagnostic["entry_kinds"] = [kind(value) for value in decoded[:8]]
+    else:
+        lines = text.splitlines()
+        diagnostic["line_count"] = len(lines)
+        diagnostic["line_kinds"] = [kind(line) for line in lines[:8]]
+        diagnostic["group_prefixed_lines"] = sum(line.lstrip().startswith("group.") for line in lines)
+        diagnostic["separators"] = {symbol: text.count(symbol) for symbol in ("=", ":", ";", "{", "}", "(", ")")}
+    return diagnostic
+
+
 def _collect_shortcuts_group_metadata(device_id):
+    from native_group_metadata import NativeGroupMetadataError, decode_group_metadata
+    from native_store_schema import NativeStoreSchemaError, survey_shortcuts_schema
+
     help_result = command(["xcrun", "simctl", "help", "get_app_container"],
                           timeout=10, check=False)
     help_text = (help_result.stdout + help_result.stderr).decode("utf-8", "replace")
@@ -344,27 +394,59 @@ def _collect_shortcuts_group_metadata(device_id):
         return {"status": "GROUPS_NOT_IN_NATIVE_HELP"}
     result = command(["xcrun", "simctl", "get_app_container", device_id,
                       "com.apple.shortcuts", "groups"], timeout=10, check=False)
+    raw = result.stdout.strip()
+    (ARTIFACTS / "native-groups-shape.json").write_text(
+        json.dumps(native_group_output_shape(raw), indent=2), encoding="utf-8")
     if result.returncode:
-        return {"status": "GROUP_METADATA_COMMAND_FAILED"}
+        return {"status": "GROUP_METADATA_COMMAND_FAILED", "group_store_read": False}
     try:
-        groups = json.loads(result.stdout)
-        if not isinstance(groups, dict) or len(groups) > 8:
-            raise ValueError
         own_data = (Path.home() / "Library/Developer/CoreSimulator/Devices" /
                     device_id / "data").resolve(strict=True)
-        metadata = {}
-        for identifier, path in groups.items():
-            if (not isinstance(identifier, str) or len(identifier) > 128
-                    or not identifier.isascii() or not isinstance(path, str)):
-                raise ValueError
-            resolved = Path(path).resolve(strict=True)
-            if not resolved.is_relative_to(own_data) or resolved == own_data:
-                raise ValueError
-            metadata[identifier] = resolved.relative_to(own_data).as_posix()
-        return {"status": "GROUP_PATH_METADATA_ONLY", "groups": metadata,
-                "group_store_read": False}
+        groups = decode_group_metadata(raw, own_data)
+        resolved_groups = []
+        seen_paths = set()
+        for group in groups:
+            path = group["path"]
+            identifier = group.get("identifier")
+            if path is None:
+                resolved_result = command([
+                    "xcrun", "simctl", "get_app_container", device_id,
+                    "com.apple.shortcuts", identifier], timeout=10, check=False)
+                if resolved_result.returncode:
+                    return {"status": "GROUP_IDENTIFIER_RESOLUTION_FAILED", "group_store_read": False}
+                declared = decode_group_metadata(resolved_result.stdout.strip(), own_data)
+                if len(declared) != 1 or declared[0]["path"] is None:
+                    return {"status": "GROUP_IDENTIFIER_PATH_UNCONFIRMED", "group_store_read": False}
+                path = declared[0]["path"]
+            if not path.is_dir() or path == own_data / "Containers/Shared/AppGroup":
+                return {"status": "GROUP_DIRECTORY_UNCONFIRMED", "group_store_read": False}
+            if path in seen_paths:
+                return {"status": "GROUP_DUPLICATE_PATH", "group_store_read": False}
+            seen_paths.add(path)
+            resolved_groups.append((identifier, path))
+
+        # Only app-associated paths, validated under this fresh simulator, reach SQLite.
+        surveys = []
+        failed = 0
+        for identifier, path in resolved_groups:
+            try:
+                survey = survey_shortcuts_schema(path)
+            except NativeStoreSchemaError as error:
+                survey = {"status": str(error), "schema_only": True}
+                failed += 1
+            surveys.append({"identifier": identifier,
+                            "path": path.relative_to(own_data).as_posix(), "survey": survey})
+        (ARTIFACTS / "native-group-store-schema.json").write_text(
+            json.dumps({"scope": "schema_only_no_rows_no_database_copy", "groups": surveys}, indent=2),
+            encoding="utf-8")
+        return {"status": "GROUP_STORE_SCHEMA_ONLY" if not failed else "GROUP_STORE_SCHEMA_PARTIAL_UNCONFIRMED",
+                "groups": len(surveys), "surveyed_ok": len(surveys) - failed, "failed": failed,
+                "group_schema_read": not failed, "group_rows_read": False,
+                "database_copy": False, "condition_payload_proven": False}
+    except NativeGroupMetadataError as error:
+        return {"status": str(error), "group_store_read": False}
     except (ValueError, OSError, TypeError):
-        return {"status": "GROUP_METADATA_UNCONFIRMED"}
+        return {"status": "GROUP_METADATA_UNCONFIRMED", "group_store_read": False}
 
 
 def main():
@@ -404,12 +486,7 @@ def main():
         receipt["bootstatus_exit"] = boot_status.returncode
         bundle = "com.apple.shortcuts"
         receipt["shortcuts_bundle_candidate"] = bundle
-        try:
-            before = command(["xcrun", "simctl", "io", device_id, "screenshot",
-                              str(ARTIFACTS / "before-ui-test.png")], timeout=20, check=False)
-            receipt["before_screenshot_exit"] = before.returncode
-        except subprocess.TimeoutExpired:
-            receipt["before_screenshot_exit"] = "timeout"
+        receipt["before_screenshot_exit"] = "not_attempted_after_repeated_pre_ui_timeouts"
         env = dict(SAFE_ENV, TEST_RUNNER_SHORTCUTS_BUNDLE_ID=bundle,
                    TEST_RUNNER_SHORTCUTS_PROBE_MODE="schema-only")
         result_path = ROOT.parent / "ProbeResults.xcresult"
