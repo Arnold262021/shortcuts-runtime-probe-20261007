@@ -416,11 +416,13 @@ def collect_native_entitlement_metadata(device_id):
         return {"status": "NATIVE_BUNDLE_METADATA_UNCONFIRMED", "system_store_read": False}
 
 
-def collect_native_open_files(device_id, *, inspect_schema=False):
+def collect_native_open_files(device_id, *, inspect_schema=False, inspect_actions=False):
     from native_open_files import NativeOpenFilesError, parse_simctl_launch, parse_lsof_metadata, lsof_output_shape
 
     closed = {"open_handle_contents_read": False, "database_copy": False,
               "condition_payload_proven": False}
+    if inspect_schema and inspect_actions:
+        return {**closed, "status": "NATIVE_INSPECTION_MODES_CONFLICT"}
     try:
         device_root = Path.home() / "Library/Developer/CoreSimulator/Devices" / device_id
         own_data = device_root / "data"
@@ -461,6 +463,28 @@ def collect_native_open_files(device_id, *, inspect_schema=False):
             json.dumps(metadata, indent=2), encoding="utf-8")
         receipt = {**closed, "status": metadata["status"],
                    "process_identity_stable": True, "observed_paths": len(metadata["paths"])}
+        if inspect_actions:
+            closed.update(open_handle_contents_read="unconfirmed", row_values_read="unconfirmed")
+            from native_synthetic_actions import NativeSyntheticActionsError, inspect_observed_synthetic_actions
+            try:
+                analysis = inspect_observed_synthetic_actions(own_data, metadata["paths"])
+            except NativeSyntheticActionsError as error:
+                failure = {**receipt, "status": "SYNTHETIC_ACTION_BLOB_UNCONFIRMED",
+                           "action_error": str(error), "open_handle_contents_read": "unconfirmed",
+                           "row_values_read": "unconfirmed"}
+                diagnostic = error.diagnostic()
+                if diagnostic is not None:
+                    failure["blob_diagnostic"] = diagnostic
+                    (ARTIFACTS / "native-synthetic-action-failure.json").write_text(
+                        json.dumps({"status": failure["status"], "error": str(error),
+                                    "blob": diagnostic}, indent=2), encoding="utf-8")
+                return failure
+            (ARTIFACTS / "native-synthetic-action-shape.json").write_text(
+                json.dumps(analysis, indent=2), encoding="utf-8")
+            receipt.update(status=analysis["status"], open_handle_contents_read=True,
+                           row_values_read=True, selected_action_blob_only=True,
+                           synthetic_marker_storage_observed=True)
+            return receipt
         if inspect_schema:
             closed["open_handle_contents_read"] = "unconfirmed"
             from native_store_schema import NativeStoreSchemaError, survey_observed_shortcuts_file
@@ -638,7 +662,7 @@ def main():
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise RuntimeError("GITHUB_MACOS_RUNNER_REQUIRED")
     mode = os.environ.get("SHORTCUTS_PROBE_EXECUTION_MODE", "open-handles")
-    if mode not in {"open-handles", "lsof-preflight", "observed-shortcuts-schema"}:
+    if mode not in {"open-handles", "lsof-preflight", "observed-shortcuts-schema", "synthetic-action-shape"}:
         raise RuntimeError("UNKNOWN_PROBE_EXECUTION_MODE")
     ARTIFACTS.mkdir(exist_ok=False)
     TIMINGS.clear()
@@ -730,12 +754,21 @@ def main():
             "PROBE_SYNTHETIC_LIBRARY_NONEMPTY_AFTER_RELAUNCH=true" in diagnostics)
         if not receipt["synthetic_library_nonempty_after_relaunch_observed"]:
             raise RuntimeError("SYNTHETIC_LIBRARY_PERSISTENCE_UNCONFIRMED")
+        if mode == "synthetic-action-shape" and "PROBE_FRESH_LIBRARY_EMPTY=true" not in diagnostics:
+            raise RuntimeError("FRESH_SYNTHETIC_LIBRARY_EMPTY_UNCONFIRMED")
         # Prior app/group schemas and empty entitlements are closed discoveries.
-        receipt["native_open_handle_metadata"] = collect_native_open_files(
-            device_id, inspect_schema=(mode == "observed-shortcuts-schema"))
+        if mode == "synthetic-action-shape":
+            receipt["native_open_handle_metadata"] = collect_native_open_files(device_id, inspect_actions=True)
+        else:
+            receipt["native_open_handle_metadata"] = collect_native_open_files(
+                device_id, inspect_schema=(mode == "observed-shortcuts-schema"))
         receipt["status"] = receipt["native_open_handle_metadata"]["status"]
-        accepted = ({"SHORTCUTS_LIBRARY_SCHEMA_ONLY"} if mode == "observed-shortcuts-schema" else
-                    {"OPEN_HANDLE_PATH_METADATA_OBSERVED", "NO_ASSOCIATED_OPEN_HANDLE_OBSERVED"})
+        if mode == "synthetic-action-shape":
+            accepted = {"SYNTHETIC_ACTION_MARKER_OBSERVED"}
+        elif mode == "observed-shortcuts-schema":
+            accepted = {"SHORTCUTS_LIBRARY_SCHEMA_ONLY"}
+        else:
+            accepted = {"OPEN_HANDLE_PATH_METADATA_OBSERVED", "NO_ASSOCIATED_OPEN_HANDLE_OBSERVED"}
         if receipt["status"] not in accepted:
             raise RuntimeError(receipt["status"])
         return 0

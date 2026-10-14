@@ -12,6 +12,7 @@ name: Shortcuts Simulator Inspection
           - open-handles
           - lsof-preflight
           - observed-shortcuts-schema
+          - synthetic-action-shape
 
 permissions:
   contents: read

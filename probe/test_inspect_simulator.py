@@ -12,7 +12,8 @@ NATIVE_TIMEOUT_PROBE = probe.native_timeout_probe
 
 class OpenHandleBoundaryTests(unittest.TestCase):
     def exercise(self, last_pid=123, lsof_exit=0, bundle_valid=True, internal_path=True,
-                 inspect_schema=False, observed_name="observed.db", stale_artifact=False):
+                 inspect_schema=False, observed_name="observed.db", stale_artifact=False,
+                 inspect_actions=False):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()
             data = home / "Library/Developer/CoreSimulator/Devices/owned/data"
@@ -37,13 +38,24 @@ class OpenHandleBoundaryTests(unittest.TestCase):
                     patch.object(probe, "verify_native_shortcuts_bundle",
                                  side_effect=None if bundle_valid else RuntimeError("BUNDLE_ID_UNCONFIRMED")), \
                     patch.object(probe, "command", side_effect=results) as command:
-                result = probe.collect_native_open_files("owned", inspect_schema=inspect_schema)
+                result = probe.collect_native_open_files("owned", inspect_schema=inspect_schema,
+                                                        inspect_actions=inspect_actions)
             artifact = home / "native-open-file-paths.json"
             metadata = artifact.read_text() if artifact.exists() else None
             schema_file = home / "native-shortcuts-library-schema.json"
             self.assertEqual(schema_file.exists(), result["status"] == "SHORTCUTS_LIBRARY_SCHEMA_ONLY")
             if schema_file.exists():
                 self.assertNotIn("SENTINEL", schema_file.read_text())
+            actions_file = home / "native-synthetic-action-shape.json"
+            self.assertEqual(actions_file.exists(), result["status"] == "SYNTHETIC_ACTION_MARKER_OBSERVED")
+            if actions_file.exists():
+                self.assertNotIn("SENTINEL", actions_file.read_text())
+            failure_file = home / "native-synthetic-action-failure.json"
+            self.assertEqual(failure_file.exists(), "blob_diagnostic" in result)
+            if failure_file.exists():
+                saved_failure = json.loads(failure_file.read_text())
+                self.assertEqual(saved_failure["blob"], result["blob_diagnostic"])
+                self.assertNotIn("SENTINEL", failure_file.read_text())
             shape_file = home / "native-shortcuts-lsof-shape.json"
             if shape_file.exists():
                 shape = shape_file.read_text()
@@ -165,6 +177,67 @@ class OpenHandleBoundaryTests(unittest.TestCase):
         self.assertEqual(result["status"], "OPEN_HANDLE_NATIVE_METADATA_UNCONFIRMED")
         self.assertEqual(result["open_handle_contents_read"], "unconfirmed")
         self.assertNotIn("SENTINEL", str(result))
+
+    def test_actions_analysis_uses_current_owned_paths_without_payload_claim(self):
+        target = "Library/Shortcuts/Shortcuts.sqlite"
+        with patch("native_synthetic_actions.inspect_observed_synthetic_actions", return_value={
+                "status": "SYNTHETIC_ACTION_MARKER_OBSERVED", "marker_count_exactly_one": True}) as read:
+            result, _, _ = self.exercise(inspect_actions=True, observed_name=target)
+        self.assertEqual(read.call_args.args[1], [target])
+        self.assertEqual(read.call_count, 1)
+        self.assertTrue(result["row_values_read"])
+        self.assertTrue(result["selected_action_blob_only"])
+        self.assertFalse(result["condition_payload_proven"])
+        self.assertFalse(result["database_copy"])
+
+    def test_conflicting_modes_and_changed_pid_never_read_actions(self):
+        with patch("native_synthetic_actions.inspect_observed_synthetic_actions") as read:
+            result, _, calls = self.exercise(inspect_schema=True, inspect_actions=True)
+            self.assertEqual(result["status"], "NATIVE_INSPECTION_MODES_CONFLICT")
+            self.assertEqual(calls, [])
+            self.exercise(inspect_actions=True, last_pid=456)
+            self.exercise()
+        read.assert_not_called()
+
+    def test_actions_partial_failure_and_old_artifact_do_not_authorize(self):
+        from native_synthetic_actions import NativeSyntheticActionsError
+        with patch("native_synthetic_actions.inspect_observed_synthetic_actions", side_effect=
+                   NativeSyntheticActionsError("SYNTHETIC_ACTIONS_QUERY_FAILED")):
+            result, _, _ = self.exercise(inspect_actions=True)
+        self.assertEqual(result["status"], "SYNTHETIC_ACTION_BLOB_UNCONFIRMED")
+        self.assertEqual(result["open_handle_contents_read"], "unconfirmed")
+        self.assertEqual(result["row_values_read"], "unconfirmed")
+        with patch("native_synthetic_actions.sqlite3.connect") as connect:
+            result, _, _ = self.exercise(inspect_actions=True, stale_artifact=True)
+        connect.assert_not_called()
+        self.assertEqual(result["status"], "SYNTHETIC_ACTION_BLOB_UNCONFIRMED")
+
+    def test_actions_artifact_failure_preserves_unknown_read_state(self):
+        real_write = Path.write_text
+
+        def fail_actions_write(path, *args, **kwargs):
+            if path.name == "native-synthetic-action-shape.json":
+                raise OSError("PRIVATE_SENTINEL")
+            return real_write(path, *args, **kwargs)
+
+        with patch("native_synthetic_actions.inspect_observed_synthetic_actions", return_value={
+                "status": "SYNTHETIC_ACTION_MARKER_OBSERVED"}), \
+                patch.object(Path, "write_text", autospec=True, side_effect=fail_actions_write):
+            result, _, _ = self.exercise(inspect_actions=True)
+        self.assertEqual(result["status"], "OPEN_HANDLE_NATIVE_METADATA_UNCONFIRMED")
+        self.assertEqual(result["row_values_read"], "unconfirmed")
+        self.assertEqual(result["open_handle_contents_read"], "unconfirmed")
+        self.assertNotIn("SENTINEL", str(result))
+
+    def test_actions_failure_retains_only_allowlisted_post_blob_diagnostic(self):
+        from native_synthetic_actions import NativeSyntheticActionsError
+        diagnostic = {"length": 20, "sha256": "a" * 64, "framing": "unknown"}
+        error = NativeSyntheticActionsError("SYNTHETIC_ACTIONS_BLOB_FORMAT_UNCONFIRMED", diagnostic)
+        with patch("native_synthetic_actions.inspect_observed_synthetic_actions", side_effect=error):
+            result, _, _ = self.exercise(inspect_actions=True)
+        self.assertEqual(result["status"], "SYNTHETIC_ACTION_BLOB_UNCONFIRMED")
+        self.assertEqual(result["blob_diagnostic"], diagnostic)
+        self.assertFalse(result["condition_payload_proven"])
 
 
 class HostLsofPreflightTests(unittest.TestCase):
@@ -824,6 +897,40 @@ class SelectionTests(unittest.TestCase):
                 self.assertFalse(receipt["otp_proven"])
                 if expected:
                     self.assertEqual(receipt["failure"], status)
+
+    def test_actions_trial_requires_empty_fixture_and_only_actions_success(self):
+        identifier = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+        for empty, status, expected in ((False, "SYNTHETIC_ACTION_MARKER_OBSERVED", 1),
+                                        (True, "SYNTHETIC_ACTION_MARKER_OBSERVED", 0),
+                                        (True, "SHORTCUTS_LIBRARY_SCHEMA_ONLY", 1),
+                                        (True, "SYNTHETIC_ACTION_BLOB_UNCONFIRMED", 1)):
+            def fake_command(args, **kwargs):
+                stdout = identifier.encode() if args[1:3] == ["simctl", "create"] else b""
+                if args[:2] == ["xcodebuild", "test"]:
+                    stdout = b"PROBE_SYNTHETIC_FILTER_READY=true\nPROBE_SYNTHETIC_LIBRARY_NONEMPTY_AFTER_RELAUNCH=true\n"
+                    if empty:
+                        stdout += b"PROBE_FRESH_LIBRARY_EMPTY=true\n"
+                return probe.subprocess.CompletedProcess(args, 0, stdout, b"")
+
+            with self.subTest(empty=empty, status=status), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(probe, "ROOT", Path(directory) / "probe"), \
+                    patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                    patch.object(probe.sys, "platform", "darwin"), \
+                    patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                               "SHORTCUTS_PROBE_EXECUTION_MODE": "synthetic-action-shape"}), \
+                    patch.object(probe, "sim_json", side_effect=[self.runtimes, self.devices, self.types]), \
+                    patch.object(probe, "command", side_effect=fake_command), patch("builtins.print"):
+                self.open_probe.reset_mock()
+                self.open_probe.return_value = {"status": status}
+                self.assertEqual(probe.main(), expected)
+                if empty:
+                    self.open_probe.assert_called_once_with(identifier, inspect_actions=True)
+                else:
+                    self.open_probe.assert_not_called()
+                receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+                self.assertFalse(receipt["otp_proven"])
+                if not empty:
+                    self.assertEqual(receipt["failure"], "FRESH_SYNTHETIC_LIBRARY_EMPTY_UNCONFIRMED")
 
     def test_device_id_rejects_malformed_and_noncanonical(self):
         for identifier in (b"", b"not-a-uuid", b"ABCDEF0123456789ABCDEF0123456789",
