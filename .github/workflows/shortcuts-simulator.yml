@@ -2,6 +2,15 @@ name: Shortcuts Simulator Inspection
 
 "on":
   workflow_dispatch:
+    inputs:
+      probe_mode:
+        description: Generic lab execution mode
+        type: choice
+        required: true
+        default: open-handles
+        options:
+          - open-handles
+          - lsof-preflight
 
 permissions:
   contents: read
@@ -19,7 +28,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Inspect fresh simulator
+      - name: Inspect selected generic lab mode
+        env:
+          SHORTCUTS_PROBE_EXECUTION_MODE: ${{ inputs.probe_mode }}
         run: |
           python3 -m unittest discover -s probe -p 'test_*.py' -q
           python3 probe/inspect_simulator.py

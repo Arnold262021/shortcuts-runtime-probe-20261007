@@ -9,7 +9,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 import native_open_files as open_files
-from native_open_files import NativeOpenFilesError, parse_lsof_metadata, parse_simctl_launch
+from native_open_files import (
+    NativeOpenFilesError,
+    lsof_output_shape,
+    parse_lsof_metadata,
+    parse_simctl_launch,
+)
 
 
 class NativeOpenFilesTests(unittest.TestCase):
@@ -30,6 +35,48 @@ class NativeOpenFilesTests(unittest.TestCase):
         ):
             with self.assertRaises(NativeOpenFilesError):
                 parse_simctl_launch(invalid)
+
+    def test_describes_lsof_shape_without_retaining_values(self) -> None:
+        raw = (
+            b"p4242\n"
+            b"cShortcuts\n"
+            b"fPRIVATE_FD\n"
+            b"n/private/PRIVATE_SENTINEL\n"
+            b"nTCP->203.0.113.9:443\n"
+            b"\n"
+            b"xPRIVATE_UNKNOWN\n"
+        )
+
+        shape = lsof_output_shape(raw)
+
+        self.assertEqual(
+            {
+                "byte_count": len(raw),
+                "newline_count": 7,
+                "nul_count": 0,
+                "ends_newline": True,
+                "record_count": 7,
+                "field_classes": ["p", "c", "f", "n", "n", "blank", "unknown"],
+                "field_class_counts": {"p": 1, "c": 1, "n": 2, "f": 1, "blank": 1, "unknown": 1},
+                "absolute_n_path_count": 1,
+            },
+            shape,
+        )
+        self.assertNotIn("PRIVATE", repr(shape))
+        self.assertNotIn("203.0.113.9", repr(shape))
+
+    def test_diagnoses_truncation_and_nul_without_accepting_lsof(self) -> None:
+        self.assertEqual(0, lsof_output_shape(b"")["record_count"])
+        shape = lsof_output_shape(b"p42\nnPRIVATE\x00VALUE")
+
+        self.assertFalse(shape["ends_newline"])
+        self.assertEqual(1, shape["nul_count"])
+        self.assertEqual(["p", "n"], shape["field_classes"])
+        self.assertEqual(0, shape["absolute_n_path_count"])
+        with self.assertRaisesRegex(NativeOpenFilesError, "LSOF_TOO_LARGE"):
+            lsof_output_shape(b"x" * (64 * 1024 + 1))
+        with self.assertRaisesRegex(NativeOpenFilesError, "LSOF_LINE_LIMIT"):
+            lsof_output_shape(b"\n" * 513)
 
     def test_parses_golden_lsof_and_deduplicates_relative_paths(self) -> None:
         temporary, root = self.make_root()

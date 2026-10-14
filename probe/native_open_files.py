@@ -14,6 +14,7 @@ MAX_LSOF_LINES: Final = 512
 MAX_OPEN_PATHS: Final = 512
 MAX_PID: Final = 2**31 - 1
 SHORTCUTS_COMMAND: Final = "Shortcuts"
+_LSOF_FIELD_CLASSES: Final = ("p", "c", "n", "f", "blank", "unknown")
 
 _ERROR_CODES = frozenset(
     {
@@ -54,6 +55,50 @@ def _bounded_bytes(value: bytes, *, empty_code: str, too_large_code: str) -> byt
     if len(value) > MAX_STDOUT_BYTES:
         raise NativeOpenFilesError(too_large_code)
     return value
+
+
+def lsof_output_shape(stdout: bytes) -> dict[str, object]:
+    """Describe bounded `lsof -F` framing without retaining field values.
+
+    This diagnostic intentionally does not validate a process association and
+    never returns PIDs, commands, paths, or other field contents.
+    """
+    if not isinstance(stdout, bytes):
+        raise NativeOpenFilesError("LSOF_FORMAT_UNCONFIRMED")
+    if len(stdout) > MAX_STDOUT_BYTES:
+        raise NativeOpenFilesError("LSOF_TOO_LARGE")
+
+    records = [] if not stdout else stdout.split(b"\n")
+    if records and stdout.endswith(b"\n"):
+        records.pop()
+    if len(records) > MAX_LSOF_LINES:
+        raise NativeOpenFilesError("LSOF_LINE_LIMIT")
+
+    classes: list[str] = []
+    counts = {field_class: 0 for field_class in _LSOF_FIELD_CLASSES}
+    absolute_n_path_count = 0
+    for record in records:
+        if not record:
+            field_class = "blank"
+        elif record[:1] in (b"p", b"c", b"n", b"f"):
+            field_class = record[:1].decode("ascii")
+        else:
+            field_class = "unknown"
+        classes.append(field_class)
+        counts[field_class] += 1
+        if field_class == "n" and record[1:].startswith(b"/"):
+            absolute_n_path_count += 1
+
+    return {
+        "byte_count": len(stdout),
+        "newline_count": stdout.count(b"\n"),
+        "nul_count": stdout.count(b"\x00"),
+        "ends_newline": stdout.endswith(b"\n"),
+        "record_count": len(records),
+        "field_classes": classes,
+        "field_class_counts": counts,
+        "absolute_n_path_count": absolute_n_path_count,
+    }
 
 
 def parse_simctl_launch(stdout: bytes) -> int:

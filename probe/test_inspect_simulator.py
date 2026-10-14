@@ -90,6 +90,73 @@ class OpenHandleBoundaryTests(unittest.TestCase):
         self.assertNotIn("SENTINEL", str(result))
 
 
+class HostLsofPreflightTests(unittest.TestCase):
+    def test_host_mode_never_starts_simulator_or_ui(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(probe, "ARTIFACTS", Path(directory) / "artifacts"), \
+                patch.object(probe.sys, "platform", "darwin"), \
+                patch.dict(probe.os.environ, {"GITHUB_ACTIONS": "true",
+                           "SHORTCUTS_PROBE_EXECUTION_MODE": "lsof-preflight"}), \
+                patch.object(probe, "host_lsof_field_preflight", return_value={
+                    "status": "HOST_LSOF_FIELD_SHAPE_OBSERVED", "fixture_handle_observed": True}), \
+                patch.object(probe, "command") as command, \
+                patch.object(probe, "sim_json") as sim_json, patch("builtins.print"):
+            self.assertEqual(probe.main(), 0)
+            command.assert_not_called()
+            sim_json.assert_not_called()
+            receipt = json.loads((probe.ARTIFACTS / "receipt.json").read_text())
+            self.assertFalse(receipt["simulator_started"])
+            self.assertFalse(receipt["ui_run"])
+            self.assertFalse(receipt["shortcuts_association_proven"])
+            self.assertEqual(receipt["scope"], "host_cli_field_shape_only")
+
+    def test_preflight_keeps_fixture_open_and_never_retains_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            fixture_dir = root / "fixture"
+            fixture_dir.mkdir()
+            real_open = Path.open
+            opened_streams = []
+
+            def track_open(path, *args, **kwargs):
+                stream = real_open(path, *args, **kwargs)
+                opened_streams.append(stream)
+                return stream
+
+            def fake_command(args, **kwargs):
+                fixture = fixture_dir / "synthetic-open-file.txt"
+                self.assertTrue(fixture.exists())
+                self.assertEqual(len(opened_streams), 1)
+                self.assertFalse(opened_streams[0].closed)
+                raw = f"p{probe.os.getpid()}\ncSENTINEL_PRIVATE_COMMAND\nf4\nn{fixture}\n\n".encode()
+                return probe.subprocess.CompletedProcess(args, 0, raw, b"PRIVATE_STDERR")
+
+            with patch.object(probe, "ARTIFACTS", root), \
+                    patch.object(probe.tempfile, "TemporaryDirectory") as temporary, \
+                    patch.object(Path, "open", autospec=True, side_effect=track_open), \
+                    patch.object(probe, "command", side_effect=fake_command) as command:
+                temporary.return_value.__enter__.return_value = str(fixture_dir)
+                result = probe.host_lsof_field_preflight()
+            self.assertEqual(result["status"], "HOST_LSOF_FIELD_SHAPE_OBSERVED")
+            self.assertTrue(opened_streams[0].closed)
+            self.assertFalse(result["shortcuts_association_proven"])
+            saved = (root / "native-host-lsof-shape.json").read_text()
+            self.assertNotIn("SENTINEL", saved)
+            self.assertNotIn("synthetic-open-file", saved)
+            self.assertNotIn(str(probe.os.getpid()), saved)
+            self.assertEqual(json.loads(saved)["field_class_counts"]["f"], 1)
+            self.assertEqual(command.call_args.kwargs["timeout"], 10)
+
+    def test_nonzero_or_missing_fixture_is_red(self):
+        for exit_code in (0, 1):
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(probe, "ARTIFACTS", Path(directory)), \
+                    patch.object(probe, "command", return_value=probe.subprocess.CompletedProcess(
+                        [], exit_code, f"p{probe.os.getpid()}\ncPython\nn/not-the-fixture\n".encode(), b"")):
+                with self.assertRaisesRegex(RuntimeError, "LSOF_PREFLIGHT_UNCONFIRMED"):
+                    probe.host_lsof_field_preflight()
+
+
 class ExportBoundaryTests(unittest.TestCase):
     def test_entitlements_do_not_scan_system_groups_when_key_is_missing(self):
         import native_entitlements

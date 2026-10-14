@@ -581,10 +581,43 @@ def _collect_shortcuts_group_metadata(device_id):
         return {"status": "GROUP_METADATA_UNCONFIRMED", "group_store_read": False}
 
 
+def host_lsof_field_preflight():
+    from native_open_files import lsof_output_shape
+
+    with tempfile.TemporaryDirectory(prefix="generic-lsof-preflight-") as directory:
+        fixture = Path(directory).resolve() / "synthetic-open-file.txt"
+        with fixture.open("wb") as stream:
+            stream.write(b"GENERIC_PREFLIGHT_ONLY\n")
+            stream.flush()
+            result = command(["lsof", "-nP", "-a", "-p", str(os.getpid()), "-Fpcn"],
+                             timeout=10, check=False)
+            shape = lsof_output_shape(result.stdout)
+            shape["command_exit"] = result.returncode
+            shape["scope"] = "host_cli_field_shape_only"
+            shape["shortcuts_association_proven"] = False
+            shape["fixture_handle_observed"] = (
+                (b"n" + str(fixture).encode("utf-8") + b"\n") in result.stdout)
+            (ARTIFACTS / "native-host-lsof-shape.json").write_text(
+                json.dumps(shape, indent=2), encoding="utf-8")
+            if (result.returncode or not shape["ends_newline"] or shape["nul_count"] or
+                    not shape["fixture_handle_observed"] or
+                    (f"p{os.getpid()}\n".encode("ascii") not in result.stdout) or
+                    shape["field_class_counts"].get("p") != 1 or
+                    shape["field_class_counts"].get("c") != 1 or
+                    not shape["field_class_counts"].get("n", 0)):
+                raise RuntimeError("LSOF_PREFLIGHT_UNCONFIRMED")
+    return {"status": "HOST_LSOF_FIELD_SHAPE_OBSERVED", "simulator_started": False,
+            "ui_run": False, "shortcuts_association_proven": False,
+            "fixture_handle_observed": True}
+
+
 def main():
     global DEADLINE
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise RuntimeError("GITHUB_MACOS_RUNNER_REQUIRED")
+    mode = os.environ.get("SHORTCUTS_PROBE_EXECUTION_MODE", "open-handles")
+    if mode not in {"open-handles", "lsof-preflight"}:
+        raise RuntimeError("UNKNOWN_PROBE_EXECUTION_MODE")
     ARTIFACTS.mkdir(exist_ok=False)
     TIMINGS.clear()
     # Reserve three minutes of the job for bounded cleanup and artifact upload.
@@ -593,6 +626,11 @@ def main():
     receipt = {"scope": "fresh_account_free_simulator", "message_access": False,
                "otp_proven": False, "automation_created": False}
     try:
+        if mode == "lsof-preflight":
+            receipt.update(scope="host_cli_field_shape_only", simulator_started=False,
+                           ui_run=False, shortcuts_association_proven=False)
+            receipt.update(host_lsof_field_preflight())
+            return 0
         receipt["native_timeout_probe"] = native_timeout_probe()
         print("PROBE_NATIVE_TIMEOUT=" + json.dumps(receipt["native_timeout_probe"]), flush=True)
         if not receipt["native_timeout_probe"]["wrapper_return_bounded_with_descendant_present"]:

@@ -6,6 +6,15 @@ ROOT = Path(__file__).parent
 
 
 class ProbeLayoutTests(unittest.TestCase):
+    def test_workflow_exposes_only_the_two_bounded_lab_modes(self) -> None:
+        workflow = (ROOT / "shortcuts-simulator.yml").read_text(encoding="utf-8")
+        self.assertIn("type: choice", workflow)
+        self.assertIn("default: open-handles", workflow)
+        self.assertIn("- lsof-preflight", workflow)
+        self.assertIn("SHORTCUTS_PROBE_EXECUTION_MODE: ${{ inputs.probe_mode }}", workflow)
+        self.assertIn("timeout-minutes: 15", workflow)
+        self.assertIn("cancel-in-progress: false", workflow)
+
     def test_local_fixture_persistence_never_runs_or_exports(self) -> None:
         source = (ROOT / "AppleSimulatorProbeUITests" / "ShortcutsObservationTests.swift").read_text(encoding="utf-8")
         self.assertIn('guard requireEmptySyntheticLibrary(in: shortcuts)', source)
