@@ -52,11 +52,39 @@ final class ShortcutsObservationTests: XCTestCase {
         ) else { return }
         print("PROBE_SHARE_OPTIONS_OBSERVED=true")
         guard tapObservedShareOptions(in: shortcuts) else { return }
-        guard tapNamedControl("File", in: shortcuts, stage: "share-format-file") else { return }
-        print("PROBE_FILE_CONTROL_TAPPED=true")
-        guard tapNamedControl("Done", in: shortcuts, stage: "finish-file-options") else { return }
+        guard selectObservedFileFormat(in: shortcuts) else { return }
+        guard tapUnique(
+            shortcuts.navigationBars.matching(identifier: "Options")
+                .buttons.matching(NSPredicate(format: "label == %@", "close")),
+            in: shortcuts,
+            stage: "finish-file-options"
+        ) else { return }
         print("PROBE_FILE_EXPORT_UI_ATTEMPTED=true")
         print("PROBE_NO_RUN_OR_NETWORK_CODE=true")
+    }
+
+    @MainActor
+    private func selectObservedFileFormat(in application: XCUIApplication) -> Bool {
+        let tables = application.tables.containing(.staticText, identifier: "Send As")
+        guard tables.element(boundBy: 0).waitForExistence(timeout: stageTimeout), tables.count == 1 else {
+            return block(at: "share-format-file", in: application, reason: "expected-one-format-table")
+        }
+        let fileCells = tables.element(boundBy: 0).cells.containing(.staticText, identifier: "File")
+        guard tapExactlyOne(
+            buttons: application.buttons.matching(NSPredicate(value: false)),
+            cells: fileCells, in: application, stage: "share-format-file"
+        ) else { return false }
+        let cell = fileCells.element(boundBy: 0)
+        let deadline = Date().addingTimeInterval(stageTimeout)
+        while !cell.isSelected && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+        guard fileCells.count == 1, cell.isSelected else {
+            return block(at: "share-format-file", in: application, reason: "file-selection-not-confirmed")
+        }
+        capture(application, stage: "share-format-file-selected")
+        print("PROBE_FILE_FORMAT_SELECTED=true")
+        return true
     }
 
     @MainActor
